@@ -1094,8 +1094,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::allocator::CpuAllocator;
-    use crate::tensor::{Tensor, TensorError};
+    use std::alloc::Layout;
+
+    use crate::allocator::{CpuAllocator, TensorAllocator, TensorAllocatorError};
+    use crate::tensor::{get_strides_from_shape, Tensor, TensorError};
 
     #[test]
     fn constructor_1d() -> Result<(), TensorError> {
@@ -1278,6 +1280,101 @@ mod tests {
     fn zeros_2d() -> Result<(), TensorError> {
         let t = Tensor::<u8, 2, _>::zeros([2, 2], CpuAllocator);
         assert_eq!(t.as_slice(), vec![0, 0, 0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_tensor_creation() -> Result<(), TensorError> {
+        let t = Tensor::<u8, 2, _>::from_shape_vec([0, 3], vec![], CpuAllocator)?;
+        assert_eq!(t.shape, [0, 3]);
+        assert_eq!(t.strides, [3, 1]);
+        assert_eq!(t.numel(), 0);
+        assert!(t.as_slice().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_max_size() -> Result<(), TensorError> {
+        let shape = [1024, 1024];
+        let t = Tensor::<u8, 2, _>::from_shape_val(shape, 7u8, CpuAllocator);
+        assert_eq!(t.shape, shape);
+        assert_eq!(t.strides, [1024, 1]);
+        assert_eq!(t.numel(), 1024 * 1024);
+        assert_eq!(t.as_slice()[0], 7);
+        assert_eq!(t.as_slice()[t.numel() - 1], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_invalid_shape() {
+        let err = match Tensor::<u8, 2, _>::from_shape_vec([2, 2], vec![1, 2, 3], CpuAllocator) {
+            Ok(_) => panic!("shape/data mismatch must return an error"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, TensorError::InvalidShape(4)));
+    }
+
+    #[test]
+    fn test_allocator_error_handling() {
+        #[derive(Clone)]
+        struct FailingAllocator;
+
+        impl TensorAllocator for FailingAllocator {
+            fn alloc(&self, _layout: Layout) -> Result<*mut u8, TensorAllocatorError> {
+                Err(TensorAllocatorError::NullPointer)
+            }
+
+            fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+        }
+
+        let layout = Layout::from_size_align(16, 8).expect("valid test layout");
+        let alloc_err = FailingAllocator
+            .alloc(layout)
+            .expect_err("failing allocator must return an error");
+        assert!(matches!(alloc_err, TensorAllocatorError::NullPointer));
+
+        let tensor_err: TensorError = alloc_err.into();
+        assert!(matches!(
+            tensor_err,
+            TensorError::StorageError(TensorAllocatorError::NullPointer)
+        ));
+    }
+
+    #[test]
+    fn test_tensor_roundtrip_image_conversion() -> Result<(), TensorError> {
+        let original = Tensor::<u16, 3, _>::from_shape_fn([2, 2, 2], CpuAllocator, |[i, j, k]| {
+            (i * 4 + j * 2 + k) as u16
+        });
+        let shape = original.shape;
+        let expected = original.as_slice().to_vec();
+
+        let vec = original.into_vec();
+        let rebuilt = Tensor::<u16, 3, _>::from_shape_vec(shape, vec, CpuAllocator)?;
+
+        assert_eq!(rebuilt.shape, shape);
+        assert_eq!(rebuilt.strides, [4, 2, 1]);
+        assert_eq!(rebuilt.as_slice(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_and_layout_invariants() -> Result<(), TensorError> {
+        assert_eq!(get_strides_from_shape([5]), [1]);
+        assert_eq!(get_strides_from_shape([2, 3]), [3, 1]);
+        assert_eq!(get_strides_from_shape([2, 3, 4]), [12, 4, 1]);
+        assert_eq!(get_strides_from_shape([2, 0, 4]), [0, 4, 1]);
+
+        let t = Tensor::<u8, 2, _>::from_shape_vec([2, 3], vec![1, 2, 3, 4, 5, 6], CpuAllocator)?;
+        assert_eq!(t.strides, [3, 1]);
+
+        let transposed = t.permute_axes([1, 0]);
+        assert_eq!(transposed.strides, [1, 3]);
+
+        let contiguous = transposed.as_contiguous();
+        assert_eq!(contiguous.shape, [3, 2]);
+        assert_eq!(contiguous.strides, [2, 1]);
+        assert_eq!(contiguous.as_slice(), vec![1, 4, 2, 5, 3, 6]);
+
         Ok(())
     }
 
