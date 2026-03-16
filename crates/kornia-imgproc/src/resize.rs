@@ -391,4 +391,156 @@ mod tests {
         assert_eq!(image_resized.size().height, 3);
         Ok(())
     }
+    #[test]
+    fn test_resize_empty_image() -> Result<(), ImageError> {
+        let src = Image::<_, 1, _>::new(
+            ImageSize {
+                width: 0,
+                height: 0,
+            },
+            vec![],
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<_, 1, _>::new(
+            ImageSize {
+                width: 0,
+                height: 0,
+            },
+            vec![],
+            CpuAllocator,
+        )?;
+
+        super::resize_native(&src, &mut dst, super::InterpolationMode::Nearest)?;
+        assert_eq!(dst.size().width, 0);
+        assert_eq!(dst.size().height, 0);
+        assert!(dst.as_slice().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_resize_max_size_image() -> Result<(), ImageError> {
+        let src = Image::<_, 3, _>::new(
+            ImageSize {
+                width: 512,
+                height: 512,
+            },
+            vec![42u8; 512 * 512 * 3],
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<_, 3, _>::from_size_val(
+            ImageSize {
+                width: 1024,
+                height: 1024,
+            },
+            0u8,
+            CpuAllocator,
+        )?;
+
+        super::resize_fast_rgb(&src, &mut dst, super::InterpolationMode::Bilinear)?;
+        assert_eq!(dst.size().width, 1024);
+        assert_eq!(dst.size().height, 1024);
+        assert_eq!(dst.as_slice().len(), 1024 * 1024 * 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_resize_invalid_input() -> Result<(), ImageError> {
+        let src = Image::<_, 2, _>::new(
+            ImageSize {
+                width: 2,
+                height: 2,
+            },
+            vec![0u8; 2 * 2 * 2],
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<_, 2, _>::from_size_val(
+            ImageSize {
+                width: 1,
+                height: 1,
+            },
+            0u8,
+            CpuAllocator,
+        )?;
+
+        let err = super::resize_fast_impl(&src, &mut dst, super::InterpolationMode::Nearest)
+            .expect_err("2-channel fast resize must be rejected");
+        assert!(matches!(err, ImageError::UnsupportedChannelCount(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_boundary_conditions() -> Result<(), ImageError> {
+        let src = Image::<_, 1, _>::new(
+            ImageSize {
+                width: 1,
+                height: 1,
+            },
+            vec![7.5f32],
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<_, 1, _>::from_size_val(
+            ImageSize {
+                width: 3,
+                height: 3,
+            },
+            0.0f32,
+            CpuAllocator,
+        )?;
+
+        super::resize_native(&src, &mut dst, super::InterpolationMode::Nearest)?;
+        assert_eq!(dst.as_slice(), vec![7.5; 9]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_metrics_invalid_input() -> Result<(), ImageError> {
+        let src = Image::<_, 1, _>::new(
+            ImageSize {
+                width: 2,
+                height: 2,
+            },
+            vec![1.0f32; 4],
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<_, 1, _>::from_size_val(
+            ImageSize {
+                width: 3,
+                height: 3,
+            },
+            0.0f32,
+            CpuAllocator,
+        )?;
+
+        let err = super::resize_native(&src, &mut dst, super::InterpolationMode::Lanczos)
+            .expect_err("Lanczos is not supported by resize_native interpolation kernel");
+        assert!(matches!(err, ImageError::UnsupportedInterpolation(ref mode) if mode == "Lanczos"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_core_ops_output_shape_dtype() -> Result<(), ImageError> {
+        let src = Image::<_, 3, _>::new(
+            ImageSize {
+                width: 4,
+                height: 4,
+            },
+            (0..4 * 4 * 3).map(|v| v as u8).collect(),
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<_, 3, _>::from_size_val(
+            ImageSize {
+                width: 2,
+                height: 2,
+            },
+            0u8,
+            CpuAllocator,
+        )?;
+
+        super::resize_fast_rgb(&src, &mut dst, super::InterpolationMode::Nearest)?;
+        assert_eq!(dst.size().width, 2);
+        assert_eq!(dst.size().height, 2);
+        assert_eq!(dst.num_channels(), 3);
+        assert_eq!(dst.as_slice().len(), 2 * 2 * 3);
+        Ok(())
+    }
 }
