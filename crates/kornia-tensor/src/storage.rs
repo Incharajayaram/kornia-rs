@@ -504,4 +504,24 @@ mod tests {
         assert_eq!(buffer.into_vec(), vec![10, 2, 3, 4, 5]);
         Ok(())
     }
+
+    #[test]
+    fn test_empty_storage() -> Result<(), TensorAllocatorError> {
+        let storage = TensorStorage::<u8, CpuAllocator>::from_vec(vec![], CpuAllocator);
+        assert!(storage.is_empty());
+        assert_eq!(storage.len(), 0);
+        assert!(storage.as_slice().is_empty());
+
+        let out = storage.into_vec();
+        assert!(out.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_storage_invalid_layout() {
+        let err = Layout::array::<u8>(usize::MAX)
+            .map_err(TensorAllocatorError::LayoutError)
+            .expect_err("layout creation should fail for oversized arrays");
+        assert!(matches!(err, TensorAllocatorError::LayoutError(_)));
+    }
 }
