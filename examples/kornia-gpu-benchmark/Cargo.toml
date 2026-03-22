@@ -1,0 +1,13 @@
+[package]
+name = "kornia-gpu-benchmark"
+version = "0.1.0"
+edition = "2021"
+description = "GPU vs CPU benchmark for kornia-imgproc operations using CubeCL wgpu backend"
+
+[dependencies]
+kornia = { version = "0.1.10-rc.3" }
+cubecl = { version = "0.9.0", features = ["wgpu"] }
+cubecl-wgpu = { version = "0.9.0" }
+
+# keep this crate outside the kornia-rs workspace
+[workspace]
