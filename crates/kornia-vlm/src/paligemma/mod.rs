@@ -90,18 +90,35 @@ impl Paligemma {
     /// # Returns
     pub fn new(config: PaligemmaConfig) -> Result<Self, PaligemmaError> {
         #[cfg(feature = "cuda")]
-        let (device, dtype) = match Device::cuda_if_available(0) {
-            Ok(device) => (device, DType::BF16),
+        let (device, dtype, model) = match Device::cuda_if_available(0) {
+            Ok(device) => match Self::load_model(DType::BF16, &device) {
+                Ok(model) => (device, DType::BF16, model),
+                Err(e) => {
+                    log::warn!("CUDA model initialization failed, retrying on CPU: {e:?}");
+                    let device = Device::Cpu;
+                    let dtype = DType::F32;
+                    let model = Self::load_model(dtype, &device)?;
+                    (device, dtype, model)
+                }
+            },
             Err(e) => {
                 log::warn!("CUDA not available, defaulting to CPU: {e}");
-                (Device::Cpu, DType::F32)
+                let device = Device::Cpu;
+                let dtype = DType::F32;
+                let model = Self::load_model(dtype, &device)?;
+                (device, dtype, model)
             }
         };
 
         #[cfg(not(feature = "cuda"))]
-        let (device, dtype) = (Device::Cpu, DType::F32);
+        let (device, dtype, model) = {
+            let device = Device::Cpu;
+            let dtype = DType::F32;
+            let model = Self::load_model(dtype, &device)?;
+            (device, dtype, model)
+        };
 
-        let (model, tokenizer) = Self::load_model(dtype, &device)?;
+        let (model, tokenizer) = model;
         let img_buf = Image::from_size_val([224, 224].into(), 0, CpuAllocator)?;
         let pipeline = TextGeneration::new(model, tokenizer, device, config.into());
 

@@ -48,20 +48,32 @@ impl<A: ImageAllocator> SmolVlm<A> {
     /// # Returns
     pub fn new(config: SmolVlmConfig) -> Result<Self, SmolVlmError> {
         #[cfg(feature = "cuda")]
-        let (device, dtype) = match Device::cuda_if_available(0) {
-            Ok(device) => (device, DType::BF16),
+        let (device, model) = match Device::cuda_if_available(0) {
+            Ok(device) => match Self::load_model(DType::BF16, &device) {
+                Ok((model, tokenizer)) => (device, (model, tokenizer)),
+                Err(e) => {
+                    log::warn!("CUDA model initialization failed, retrying on CPU: {e:?}");
+                    let device = Device::Cpu;
+                    let model = Self::load_model(DType::F32, &device)?;
+                    (device, model)
+                }
+            },
             Err(e) => {
                 log::warn!("CUDA not available, defaulting to CPU: {e:?}");
-                (Device::Cpu, DType::F32)
+                let device = Device::Cpu;
+                let model = Self::load_model(DType::F32, &device)?;
+                (device, model)
             }
         };
 
         #[cfg(not(feature = "cuda"))]
-        let (device, dtype) = (Device::Cpu, DType::F32);
+        let (device, model) = {
+            let device = Device::Cpu;
+            let model = Self::load_model(DType::F32, &device)?;
+            (device, model)
+        };
 
-        // TODO: find a way to use FP32 if cuda is not available
-
-        let (model, tokenizer) = Self::load_model(dtype, &device)?;
+        let (model, tokenizer) = model;
         let image_token = tokenizer.encode("<image>", false)?;
         let image_token_tensor = Tensor::from_slice(image_token.get_ids(), &[1], &device)?;
 

@@ -162,19 +162,46 @@ impl<const N: usize, A: ImageAllocator> SmolVlm2<N, A> {
     /// This will download weights from HuggingFace Hub.
     pub fn new(config: SmolVlm2Config) -> Result<Self, SmolVlm2Error> {
         #[cfg(feature = "cuda")]
-        let (device, dtype) = match Device::cuda_if_available(0) {
-            Ok(device) => (device, DType::BF16),
-            Err(e) => {
-                log::warn!("CUDA not available, defaulting to CPU: {e:?}");
-                (Device::Cpu, DType::F32)
-            }
-        };
+        let (device, dtype, model, txt_processor, img_processor, vid_processor) =
+            match Device::cuda_if_available(0) {
+                Ok(device) => match Self::load_model(&config, DType::BF16, &device) {
+                    Ok((model, txt_processor, img_processor, vid_processor)) => (
+                        device,
+                        DType::BF16,
+                        model,
+                        txt_processor,
+                        img_processor,
+                        vid_processor,
+                    ),
+                    Err(e) => {
+                        log::warn!(
+                            "CUDA model initialization failed, retrying on CPU: {e:?}"
+                        );
+                        let device = Device::Cpu;
+                        let dtype = DType::F32;
+                        let (model, txt_processor, img_processor, vid_processor) =
+                            Self::load_model(&config, dtype, &device)?;
+                        (device, dtype, model, txt_processor, img_processor, vid_processor)
+                    }
+                },
+                Err(e) => {
+                    log::warn!("CUDA not available, defaulting to CPU: {e:?}");
+                    let device = Device::Cpu;
+                    let dtype = DType::F32;
+                    let (model, txt_processor, img_processor, vid_processor) =
+                        Self::load_model(&config, dtype, &device)?;
+                    (device, dtype, model, txt_processor, img_processor, vid_processor)
+                }
+            };
 
         #[cfg(not(feature = "cuda"))]
-        let (device, dtype) = (Device::Cpu, DType::F32);
-
-        let (model, txt_processor, img_processor, vid_processor) =
-            Self::load_model(&config, dtype, &device)?;
+        let (device, dtype, model, txt_processor, img_processor, vid_processor) = {
+            let device = Device::Cpu;
+            let dtype = DType::F32;
+            let (model, txt_processor, img_processor, vid_processor) =
+                Self::load_model(&config, dtype, &device)?;
+            (device, dtype, model, txt_processor, img_processor, vid_processor)
+        };
 
         Ok(Self {
             model,
@@ -478,7 +505,7 @@ mod tests {
     fn test_smolvlm2_text_inference() {
         env_logger::init();
 
-        let path = Path::new("../../100462016.jpeg"); // or .png
+        let path = Path::new("../../tests/data/image.jpeg");
 
         let image = match path.extension().and_then(|ext| ext.to_str()) {
             Some("jpg") | Some("jpeg") => read_image_jpeg_rgb8(path).ok(),
