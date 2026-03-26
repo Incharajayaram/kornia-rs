@@ -111,8 +111,6 @@ fn resize_bilinear_kernel(
         let x_out = out_idx % dst_w;
         let y_out = out_idx / dst_w;
 
-        // Mapping keeps x0 in [0, src_w-2] and y0 in [0, src_h-2]
-        // for dst_w,dst_h > 1 and src_w,src_h > 1.
         let scale_x = (src_w - 1) as f32 / dst_w as f32;
         let scale_y = (src_h - 1) as f32 / dst_h as f32;
         let x_src_f = x_out as f32 * scale_x;
@@ -150,95 +148,9 @@ fn launch_shape_1d(n: usize) -> (CubeCount, CubeDim) {
     (CubeCount::new_1d(cubes_x), CubeDim::new_1d(cube_dim_x))
 }
 
-fn gpu_gray_from_rgb(
-    client: &GpuClient,
-    rgb_data: &[f32],
-    width: usize,
-    height: usize,
-) -> Result<Vec<f32>, AnyError> {
-    let n_pixels = width * height;
-    let rgb_handle = client.create_from_slice(f32::as_bytes(rgb_data));
-    let gray_handle = client.empty(n_pixels * std::mem::size_of::<f32>());
-    let (cube_count, cube_dim) = launch_shape_1d(n_pixels);
-
-    unsafe {
-        gray_from_rgb_kernel::launch_unchecked::<WgpuRuntime>(
-            client,
-            cube_count,
-            cube_dim,
-            ArrayArg::from_raw_parts::<f32>(&rgb_handle, rgb_data.len(), 1),
-            ArrayArg::from_raw_parts::<f32>(&gray_handle, n_pixels, 1),
-        )?;
-    }
-
-    let bytes = client.read_one(gray_handle);
-    Ok(f32::from_bytes(&bytes).to_vec())
-}
-
-fn gpu_resize_nearest(
-    client: &GpuClient,
-    src_data: &[f32],
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-    channels: usize,
-) -> Result<Vec<f32>, AnyError> {
-    let n_out = dst_w * dst_h * channels;
-    let src_handle = client.create_from_slice(f32::as_bytes(src_data));
-    let dst_handle = client.empty(n_out * std::mem::size_of::<f32>());
-    let (cube_count, cube_dim) = launch_shape_1d(dst_w * dst_h);
-
-    unsafe {
-        resize_nearest_kernel::launch_unchecked::<WgpuRuntime>(
-            client,
-            cube_count,
-            cube_dim,
-            ArrayArg::from_raw_parts::<f32>(&src_handle, src_data.len(), 1),
-            ArrayArg::from_raw_parts::<f32>(&dst_handle, n_out, 1),
-            src_w,
-            src_h,
-            dst_w,
-            dst_h,
-            channels,
-        )?;
-    }
-
-    let bytes = client.read_one(dst_handle);
-    Ok(f32::from_bytes(&bytes).to_vec())
-}
-
-fn gpu_resize_bilinear(
-    client: &GpuClient,
-    src_data: &[f32],
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-    channels: usize,
-) -> Result<Vec<f32>, AnyError> {
-    let n_out = dst_w * dst_h * channels;
-    let src_handle = client.create_from_slice(f32::as_bytes(src_data));
-    let dst_handle = client.empty(n_out * std::mem::size_of::<f32>());
-    let (cube_count, cube_dim) = launch_shape_1d(dst_w * dst_h);
-
-    unsafe {
-        resize_bilinear_kernel::launch_unchecked::<WgpuRuntime>(
-            client,
-            cube_count,
-            cube_dim,
-            ArrayArg::from_raw_parts::<f32>(&src_handle, src_data.len(), 1),
-            ArrayArg::from_raw_parts::<f32>(&dst_handle, n_out, 1),
-            src_w,
-            src_h,
-            dst_w,
-            dst_h,
-            channels,
-        )?;
-    }
-
-    let bytes = client.read_one(dst_handle);
-    Ok(f32::from_bytes(&bytes).to_vec())
+fn sync_client(client: &GpuClient) -> Result<(), AnyError> {
+    pollster::block_on(client.sync())?;
+    Ok(())
 }
 
 fn cpu_gray_from_rgb(
@@ -323,9 +235,43 @@ where
     })
 }
 
+fn bench_gpu_kernel<F>(
+    name: &str,
+    iters: usize,
+    client: &GpuClient,
+    mut launch: F,
+) -> Result<BenchResult, AnyError>
+where
+    F: FnMut() -> Result<(), AnyError>,
+{
+    for _ in 0..5 {
+        launch()?;
+        sync_client(client)?;
+    }
+
+    let mut times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Instant::now();
+        launch()?;
+        sync_client(client)?;
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    Ok(BenchResult {
+        name: name.to_string(),
+        avg_ms: avg,
+        min_ms: min,
+        max_ms: max,
+    })
+}
+
 fn print_result(r: &BenchResult) {
     println!(
-        "  {:<35} avg: {:>7.2}ms  min: {:>6.2}ms  max: {:>6.2}ms  fps: {:>6.1}",
+        "  {:<44} avg: {:>7.2}ms  min: {:>6.2}ms  max: {:>6.2}ms  fps: {:>6.1}",
         r.name,
         r.avg_ms,
         r.min_ms,
@@ -362,6 +308,8 @@ fn main() -> Result<(), AnyError> {
     println!();
 
     let n_rgb = w * h * 3;
+    let n_gray = w * h;
+    let n_out = dst_w * dst_h;
     let rgb_data: Vec<f32> = (0..n_rgb).map(|i| (i % 255) as f32 / 255.0).collect();
 
     let rgb_image = Image::<f32, 3, _>::new(
@@ -380,11 +328,29 @@ fn main() -> Result<(), AnyError> {
     })?;
     print_result(&cpu_gray);
 
-    let gpu_gray = bench("GPU gray_from_rgb (CubeCL wgpu)", iters, || {
-        let _ = gpu_gray_from_rgb(&client, &rgb_data, w, h)?;
-        Ok(())
-    })?;
+    let rgb_handle = client.create_from_slice(f32::as_bytes(&rgb_data));
+    let gray_handle = client.empty(n_gray * std::mem::size_of::<f32>());
+    let (gray_cube_count, gray_cube_dim) = launch_shape_1d(n_gray);
+
+    let gpu_gray = bench_gpu_kernel(
+        "GPU gray_from_rgb (CubeCL wgpu, kernel-only)",
+        iters,
+        &client,
+        || {
+            unsafe {
+                gray_from_rgb_kernel::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    gray_cube_count.clone(),
+                    gray_cube_dim,
+                    ArrayArg::from_raw_parts::<f32>(&rgb_handle, rgb_data.len(), 1),
+                    ArrayArg::from_raw_parts::<f32>(&gray_handle, n_gray, 1),
+                )?;
+            }
+            Ok(())
+        },
+    )?;
     print_result(&gpu_gray);
+    let _gray_out_once = f32::from_bytes(&client.read_one(gray_handle)).to_vec();
     print_speedup(&cpu_gray, &gpu_gray);
     println!();
 
@@ -401,11 +367,34 @@ fn main() -> Result<(), AnyError> {
     })?;
     print_result(&cpu_nn);
 
-    let gpu_nn = bench("GPU resize_nearest (CubeCL wgpu)", iters, || {
-        let _ = gpu_resize_nearest(&client, &gray_data, w, h, dst_w, dst_h, 1)?;
-        Ok(())
-    })?;
+    let gray_src_handle = client.create_from_slice(f32::as_bytes(&gray_data));
+    let nn_dst_handle = client.empty(n_out * std::mem::size_of::<f32>());
+    let (resize_cube_count, resize_cube_dim) = launch_shape_1d(n_out);
+
+    let gpu_nn = bench_gpu_kernel(
+        "GPU resize_nearest (CubeCL wgpu, kernel-only)",
+        iters,
+        &client,
+        || {
+            unsafe {
+                resize_nearest_kernel::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    resize_cube_count.clone(),
+                    resize_cube_dim,
+                    ArrayArg::from_raw_parts::<f32>(&gray_src_handle, gray_data.len(), 1),
+                    ArrayArg::from_raw_parts::<f32>(&nn_dst_handle, n_out, 1),
+                    w,
+                    h,
+                    dst_w,
+                    dst_h,
+                    1,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
     print_result(&gpu_nn);
+    let _nn_out_once = f32::from_bytes(&client.read_one(nn_dst_handle)).to_vec();
     print_speedup(&cpu_nn, &gpu_nn);
     println!();
 
@@ -420,11 +409,32 @@ fn main() -> Result<(), AnyError> {
     })?;
     print_result(&cpu_bl);
 
-    let gpu_bl = bench("GPU resize_bilinear (CubeCL wgpu)", iters, || {
-        let _ = gpu_resize_bilinear(&client, &gray_data, w, h, dst_w, dst_h, 1)?;
-        Ok(())
-    })?;
+    let bl_dst_handle = client.empty(n_out * std::mem::size_of::<f32>());
+
+    let gpu_bl = bench_gpu_kernel(
+        "GPU resize_bilinear (CubeCL wgpu, kernel-only)",
+        iters,
+        &client,
+        || {
+            unsafe {
+                resize_bilinear_kernel::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    resize_cube_count.clone(),
+                    resize_cube_dim,
+                    ArrayArg::from_raw_parts::<f32>(&gray_src_handle, gray_data.len(), 1),
+                    ArrayArg::from_raw_parts::<f32>(&bl_dst_handle, n_out, 1),
+                    w,
+                    h,
+                    dst_w,
+                    dst_h,
+                    1,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
     print_result(&gpu_bl);
+    let _bl_out_once = f32::from_bytes(&client.read_one(bl_dst_handle)).to_vec();
     print_speedup(&cpu_bl, &gpu_bl);
     println!();
 
@@ -453,6 +463,7 @@ fn main() -> Result<(), AnyError> {
         cpu_bl.avg_ms / gpu_bl.avg_ms
     );
     println!("=======================================================");
+    println!("Note: GPU timing is kernel-only (persistent buffers, one-time upload/readback).");
 
     Ok(())
 }
