@@ -49,20 +49,51 @@ impl<A: ImageAllocator> SmolVlm<A> {
     pub fn new(config: SmolVlmConfig) -> Result<Self, SmolVlmError> {
         #[cfg(feature = "cuda")]
         let (device, model) = match Device::cuda_if_available(0) {
-            Ok(device) => match Self::load_model(DType::BF16, &device) {
-                Ok((model, tokenizer)) => (device, (model, tokenizer)),
-                Err(e) => {
-                    log::warn!("CUDA model initialization failed, retrying on CPU: {e:?}");
-                    let device = Device::Cpu;
-                    let model = Self::load_model(DType::F32, &device)?;
-                    (device, model)
+            Ok(device) => {
+                let cuda_load = Self::load_model(DType::BF16, &device)
+                    .or_else(|bf16_err| {
+                        log::warn!("CUDA BF16 model initialization failed: {bf16_err:?}");
+                        Self::load_model(DType::F16, &device)
+                    })
+                    .or_else(|f16_err| {
+                        log::warn!("CUDA F16 model initialization failed: {f16_err:?}");
+                        Self::load_model(DType::F32, &device)
+                    });
+
+                match cuda_load {
+                    Ok(model) => (device, model),
+                    #[cfg(feature = "flash-attn")]
+                    Err(e) => {
+                        log::warn!(
+                            "CUDA model initialization failed with flash-attn enabled; CPU fallback is not supported: {e:?}"
+                        );
+                        return Err(e);
+                    }
+                    #[cfg(not(feature = "flash-attn"))]
+                    Err(e) => {
+                        log::warn!("CUDA model initialization failed, retrying on CPU: {e:?}");
+                        let device = Device::Cpu;
+                        let model = Self::load_model(DType::F32, &device)?;
+                        (device, model)
+                    }
                 }
-            },
+            }
             Err(e) => {
+                #[cfg(feature = "flash-attn")]
+                {
+                    log::warn!(
+                        "CUDA not available and flash-attn is enabled; CPU fallback is not supported: {e:?}"
+                    );
+                    return Err(SmolVlmError::CandleError(e));
+                }
+                #[cfg(not(feature = "flash-attn"))]
                 log::warn!("CUDA not available, defaulting to CPU: {e:?}");
+                #[cfg(not(feature = "flash-attn"))]
+                {
                 let device = Device::Cpu;
                 let model = Self::load_model(DType::F32, &device)?;
                 (device, model)
+                }
             }
         };
 

@@ -91,22 +91,54 @@ impl Paligemma {
     pub fn new(config: PaligemmaConfig) -> Result<Self, PaligemmaError> {
         #[cfg(feature = "cuda")]
         let (device, dtype, model) = match Device::cuda_if_available(0) {
-            Ok(device) => match Self::load_model(DType::BF16, &device) {
-                Ok(model) => (device, DType::BF16, model),
-                Err(e) => {
-                    log::warn!("CUDA model initialization failed, retrying on CPU: {e:?}");
-                    let device = Device::Cpu;
-                    let dtype = DType::F32;
-                    let model = Self::load_model(dtype, &device)?;
-                    (device, dtype, model)
+            Ok(device) => {
+                let cuda_load = Self::load_model(DType::BF16, &device)
+                    .map(|model| (DType::BF16, model))
+                    .or_else(|bf16_err| {
+                        log::warn!("CUDA BF16 model initialization failed: {bf16_err:?}");
+                        Self::load_model(DType::F16, &device).map(|model| (DType::F16, model))
+                    })
+                    .or_else(|f16_err| {
+                        log::warn!("CUDA F16 model initialization failed: {f16_err:?}");
+                        Self::load_model(DType::F32, &device).map(|model| (DType::F32, model))
+                    });
+
+                match cuda_load {
+                    Ok((dtype, model)) => (device, dtype, model),
+                    #[cfg(feature = "flash-attn")]
+                    Err(e) => {
+                        log::warn!(
+                            "CUDA model initialization failed with flash-attn enabled; CPU fallback is not supported: {e:?}"
+                        );
+                        return Err(e);
+                    }
+                    #[cfg(not(feature = "flash-attn"))]
+                    Err(e) => {
+                        log::warn!("CUDA model initialization failed, retrying on CPU: {e:?}");
+                        let device = Device::Cpu;
+                        let dtype = DType::F32;
+                        let model = Self::load_model(dtype, &device)?;
+                        (device, dtype, model)
+                    }
                 }
-            },
+            }
             Err(e) => {
+                #[cfg(feature = "flash-attn")]
+                {
+                    log::warn!(
+                        "CUDA not available and flash-attn is enabled; CPU fallback is not supported: {e:?}"
+                    );
+                    return Err(PaligemmaError::CandleError(e));
+                }
+                #[cfg(not(feature = "flash-attn"))]
                 log::warn!("CUDA not available, defaulting to CPU: {e}");
+                #[cfg(not(feature = "flash-attn"))]
+                {
                 let device = Device::Cpu;
                 let dtype = DType::F32;
                 let model = Self::load_model(dtype, &device)?;
                 (device, dtype, model)
+                }
             }
         };
 
