@@ -8,7 +8,7 @@ This is a simple, single-prompt video understanding example. Given a video file,
 > **Note:** The `gstreamer` feature must be enabled for video support. Add `--features gstreamer` to your command if needed.
 
 ```bash
-cargo run --bin smol_vlm2 --release --features "gstreamer flash-attn cuda" -- --video-path example_video.mp4 --sampling uniform --sample-frames 8 --max-tokens 128 --prompt "Describe the video."
+cargo run --bin smol_vlm2 --release --features "cuda gstreamer" -- --video-path example_video.mp4 --sampling uniform --sample-frames 8 --max-tokens 128 --prompt "Describe the video."
 ```
 
 ### Arguments
@@ -21,5 +21,5 @@ cargo run --bin smol_vlm2 --release --features "gstreamer flash-attn cuda" -- --
 ## Example
 
 ```bash
-cargo run --bin smol_vlm2 --release --features "gstreamer flash-attn cuda" -- --video-path example_video.mp4 --sampling uniform --sample-frames 8 --max-tokens 128 --prompt "Describe the video."
+cargo run --bin smol_vlm2 --release --features "cuda gstreamer" -- --video-path example_video.mp4 --sampling uniform --sample-frames 8 --max-tokens 128 --prompt "Describe the video."
 ```

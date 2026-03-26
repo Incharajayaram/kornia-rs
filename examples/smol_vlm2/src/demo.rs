@@ -74,8 +74,7 @@ mod tests {
     use kornia_vlm::smolvlm2::{InputMedia, Line, Message, Role, SmolVlm2, SmolVlm2Config};
     use std::path::Path;
 
-    // RUST_LOG=debug cargo test -p smol_vlm2 --features "gstreamer,cuda,flash-attn" -- --nocapture --ignored test_smolvlm2_image_inference_speed
-    // cargo test --release -p smol_vlm2 --features "gstreamer,cuda,flash-attn" -- --nocapture --ignored test_smolvlm2_image_inference_speed
+    // RUST_LOG=info cargo test --release -p smol_vlm2 --features "cuda" -- --nocapture --ignored test_smolvlm2_image_inference_speed
     /// Single image inference speed test
     #[test]
     #[ignore = "Requires CUDA"]
@@ -86,7 +85,7 @@ mod tests {
         log::info!("SMOLVLM2 RUST IMAGE INFERENCE SPEED TEST");
         log::info!("============================================================");
 
-        let path = Path::new("../../100462016.jpeg");
+        let path = Path::new("../../tests/data/image.jpeg");
         let image = match path.extension().and_then(|ext| ext.to_str()) {
             Some("jpg") | Some("jpeg") => read_image_jpeg_rgb8(path).ok(),
             Some("png") => read_image_png_rgb8(path).ok(),
@@ -106,7 +105,11 @@ mod tests {
             debug: true,
             ..Default::default()
         };
+        let model_init_start = std::time::Instant::now();
         let mut model = SmolVlm2::<32, CpuAllocator>::new(config).unwrap();
+        let model_init_secs = model_init_start.elapsed().as_secs_f64();
+        log::info!("Model initialization time: {:.3}s", model_init_secs);
+
         let sample_len = 500;
 
         let mut inference_times = Vec::new();
@@ -151,12 +154,24 @@ mod tests {
 
         if !inference_times.is_empty() {
             let avg_time = inference_times.iter().sum::<f64>() / inference_times.len() as f64;
+            let min_time = inference_times.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_time = inference_times
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            log::info!("------------------------------------------------------------");
+            log::info!("Image path: {:?}", path);
+            log::info!("Model init: {:.3}s", model_init_secs);
+            log::info!("Inference runs: {}", inference_times.len());
             log::info!("Average inference time: {:.3}s", avg_time);
+            log::info!("Min inference time: {:.3}s", min_time);
+            log::info!("Max inference time: {:.3}s", max_time);
+            log::info!("------------------------------------------------------------");
         }
     }
 
-    // RUST_LOG=debug cargo test -p smol_vlm2 --features "gstreamer,cuda,flash-attn" -- --nocapture --ignored test_smolvlm2_video_inference_speed
-    // cargo test --release -p smol_vlm2 --features "gstreamer,cuda,flash-attn" -- --nocapture --ignored test_smolvlm2_video_inference_speed
+    // RUST_LOG=info cargo test --release -p smol_vlm2 --features "cuda gstreamer" -- --nocapture --ignored test_smolvlm2_video_inference_speed
     /// Video inference speed test (previously speed comparison)
     #[test]
     #[ignore = "Video inference speed test - requires CUDA/gstreamer"]
