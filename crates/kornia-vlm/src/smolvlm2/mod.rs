@@ -602,4 +602,86 @@ mod tests {
             )
             .expect("Inference failed");
     }
+
+    #[test]
+    #[ignore = "Requires CUDA"]
+    fn test_smolvlm2_image_inference_speed() {
+        env_logger::init();
+
+        let path = Path::new("../../tests/data/image.jpeg");
+        let image = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("jpg") | Some("jpeg") => read_image_jpeg_rgb8(path).ok(),
+            Some("png") => read_image_png_rgb8(path).ok(),
+            _ => None,
+        }
+        .expect("failed to load test image");
+
+        let config = SmolVlm2Config {
+            seed: 42,
+            do_sample: false,
+            debug: true,
+            ..Default::default()
+        };
+
+        let model_init_start = std::time::Instant::now();
+        let mut model = SmolVlm2::<32, _>::new(config).unwrap();
+        let model_init_secs = model_init_start.elapsed().as_secs_f64();
+
+        let sample_len = 80;
+        let runs = 3;
+        let prompts = [
+            "Describe the image.",
+            "What do you see?",
+            "Summarize the scene in one sentence.",
+        ];
+
+        let mut inference_times = Vec::new();
+        for prompt in prompts {
+            for run in 1..=runs {
+                model.clear_context().unwrap();
+                let start = std::time::Instant::now();
+                let response = model
+                    .inference(
+                        vec![Message {
+                            role: Role::User,
+                            content: vec![
+                                Line::Image,
+                                Line::Text {
+                                    text: prompt.to_string(),
+                                },
+                            ],
+                        }],
+                        Some(InputMedia::Images(vec![image.clone()])),
+                        sample_len,
+                        CpuAllocator,
+                    )
+                    .unwrap_or_else(|e| format!("Inference failed: {:?}", e));
+                let elapsed = start.elapsed().as_secs_f64();
+                inference_times.push(elapsed);
+                log::info!(
+                    "Prompt: {} | Run {}: inference completed in {:.3}s",
+                    prompt,
+                    run,
+                    elapsed
+                );
+                log::info!("Model response: {}", response);
+            }
+        }
+
+        let avg_time = inference_times.iter().sum::<f64>() / inference_times.len() as f64;
+        let min_time = inference_times.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_time = inference_times
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        log::info!("------------------------------------------------------------");
+        log::info!("Image path: {:?}", path);
+        log::info!("Model init: {:.3}s", model_init_secs);
+        log::info!("Inference runs: {}", inference_times.len());
+        log::info!("Average inference time: {:.3}s", avg_time);
+        log::info!("Min inference time: {:.3}s", min_time);
+        log::info!("Max inference time: {:.3}s", max_time);
+        log::info!("------------------------------------------------------------");
+    }
 }
