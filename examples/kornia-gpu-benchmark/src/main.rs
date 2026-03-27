@@ -269,6 +269,40 @@ where
     })
 }
 
+fn bench_gpu_roundtrip<F>(
+    name: &str,
+    iters: usize,
+    client: &GpuClient,
+    mut run_once: F,
+) -> Result<BenchResult, AnyError>
+where
+    F: FnMut() -> Result<(), AnyError>,
+{
+    for _ in 0..5 {
+        run_once()?;
+        sync_client(client)?;
+    }
+
+    let mut times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Instant::now();
+        run_once()?;
+        sync_client(client)?;
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    Ok(BenchResult {
+        name: name.to_string(),
+        avg_ms: avg,
+        min_ms: min,
+        max_ms: max,
+    })
+}
+
 fn print_result(r: &BenchResult) {
     println!(
         "  {:<44} avg: {:>7.2}ms  min: {:>6.2}ms  max: {:>6.2}ms  fps: {:>6.1}",
@@ -352,6 +386,28 @@ fn main() -> Result<(), AnyError> {
     print_result(&gpu_gray);
     let _gray_out_once = f32::from_bytes(&client.read_one(gray_handle)).to_vec();
     print_speedup(&cpu_gray, &gpu_gray);
+
+    let gpu_gray_roundtrip = bench_gpu_roundtrip(
+        "GPU gray_from_rgb (CubeCL wgpu, upload+kernel+download)",
+        iters,
+        &client,
+        || {
+            let rgb_handle = client.create_from_slice(f32::as_bytes(&rgb_data));
+            let gray_handle = client.empty(n_gray * std::mem::size_of::<f32>());
+            unsafe {
+                gray_from_rgb_kernel::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    gray_cube_count.clone(),
+                    gray_cube_dim,
+                    ArrayArg::from_raw_parts::<f32>(&rgb_handle, rgb_data.len(), 1),
+                    ArrayArg::from_raw_parts::<f32>(&gray_handle, n_gray, 1),
+                )?;
+            }
+            let _ = f32::from_bytes(&client.read_one(gray_handle)).to_vec();
+            Ok(())
+        },
+    )?;
+    print_result(&gpu_gray_roundtrip);
     println!();
 
     println!(
@@ -396,6 +452,33 @@ fn main() -> Result<(), AnyError> {
     print_result(&gpu_nn);
     let _nn_out_once = f32::from_bytes(&client.read_one(nn_dst_handle)).to_vec();
     print_speedup(&cpu_nn, &gpu_nn);
+
+    let gpu_nn_roundtrip = bench_gpu_roundtrip(
+        "GPU resize_nearest (CubeCL wgpu, upload+kernel+download)",
+        iters,
+        &client,
+        || {
+            let gray_src_handle = client.create_from_slice(f32::as_bytes(&gray_data));
+            let nn_dst_handle = client.empty(n_out * std::mem::size_of::<f32>());
+            unsafe {
+                resize_nearest_kernel::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    resize_cube_count.clone(),
+                    resize_cube_dim,
+                    ArrayArg::from_raw_parts::<f32>(&gray_src_handle, gray_data.len(), 1),
+                    ArrayArg::from_raw_parts::<f32>(&nn_dst_handle, n_out, 1),
+                    w,
+                    h,
+                    dst_w,
+                    dst_h,
+                    1,
+                )?;
+            }
+            let _ = f32::from_bytes(&client.read_one(nn_dst_handle)).to_vec();
+            Ok(())
+        },
+    )?;
+    print_result(&gpu_nn_roundtrip);
     println!();
 
     println!(
@@ -436,6 +519,33 @@ fn main() -> Result<(), AnyError> {
     print_result(&gpu_bl);
     let _bl_out_once = f32::from_bytes(&client.read_one(bl_dst_handle)).to_vec();
     print_speedup(&cpu_bl, &gpu_bl);
+
+    let gpu_bl_roundtrip = bench_gpu_roundtrip(
+        "GPU resize_bilinear (CubeCL wgpu, upload+kernel+download)",
+        iters,
+        &client,
+        || {
+            let gray_src_handle = client.create_from_slice(f32::as_bytes(&gray_data));
+            let bl_dst_handle = client.empty(n_out * std::mem::size_of::<f32>());
+            unsafe {
+                resize_bilinear_kernel::launch_unchecked::<WgpuRuntime>(
+                    &client,
+                    resize_cube_count.clone(),
+                    resize_cube_dim,
+                    ArrayArg::from_raw_parts::<f32>(&gray_src_handle, gray_data.len(), 1),
+                    ArrayArg::from_raw_parts::<f32>(&bl_dst_handle, n_out, 1),
+                    w,
+                    h,
+                    dst_w,
+                    dst_h,
+                    1,
+                )?;
+            }
+            let _ = f32::from_bytes(&client.read_one(bl_dst_handle)).to_vec();
+            Ok(())
+        },
+    )?;
+    print_result(&gpu_bl_roundtrip);
     println!();
 
     println!("=======================================================");
@@ -463,7 +573,28 @@ fn main() -> Result<(), AnyError> {
         cpu_bl.avg_ms / gpu_bl.avg_ms
     );
     println!("=======================================================");
-    println!("Note: GPU timing is kernel-only (persistent buffers, one-time upload/readback).");
+    println!(" Round-trip timings (upload + kernel + download):");
+    println!(
+        " gray_from_rgb   CPU {:>7.2}ms  GPU {:>6.2}ms  {:>5.1}x speedup",
+        cpu_gray.avg_ms,
+        gpu_gray_roundtrip.avg_ms,
+        cpu_gray.avg_ms / gpu_gray_roundtrip.avg_ms
+    );
+    println!(
+        " resize_nearest  CPU {:>7.2}ms  GPU {:>6.2}ms  {:>5.1}x speedup",
+        cpu_nn.avg_ms,
+        gpu_nn_roundtrip.avg_ms,
+        cpu_nn.avg_ms / gpu_nn_roundtrip.avg_ms
+    );
+    println!(
+        " resize_bilinear CPU {:>7.2}ms  GPU {:>6.2}ms  {:>5.1}x speedup",
+        cpu_bl.avg_ms,
+        gpu_bl_roundtrip.avg_ms,
+        cpu_bl.avg_ms / gpu_bl_roundtrip.avg_ms
+    );
+    println!("=======================================================");
+    println!("Note: kernel-only timings reuse persistent GPU buffers.");
+    println!("Note: round-trip timings include upload, kernel launch, sync, and download.");
 
     Ok(())
 }

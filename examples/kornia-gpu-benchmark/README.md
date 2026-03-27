@@ -62,11 +62,18 @@ cd ~/kornia-rs/examples/kornia-gpu-benchmark
 cargo run --release -- --iters 200 --width 3840 --height 2160
 ```
 
+The benchmark prints two GPU views:
+
+- `kernel-only`: persistent buffers, one-time upload, and one-time readback
+- `upload+kernel+download`: per-iteration round-trip timing that includes transfer overhead
+
 ## Notes
 
 - Use `--release`. Debug mode gives misleading CPU timings.
 - These numbers are kernel-focused and do not represent full application pipeline timings.
 - Full pipeline timings were measured in the Bubbaloop node demo.
+- The round-trip section is the useful reference when discussing the cost of host-device transfers and
+  the value of a future zero-copy path.
 
 ## Cloud VLM Validation
 
