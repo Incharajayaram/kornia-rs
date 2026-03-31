@@ -128,6 +128,6 @@ Reference result from the successful validation run:
 
 The corresponding Bubbaloop node demo lives in:
 
-- `../../bubbaloop/kornia-gpu-node`
+- https://github.com/Incharajayaram/bubbaloop/blob/gsoc/gpu-demo-wgpu/kornia-gpu-node/README.md
 
 That node was used to measure end-to-end webcam pipeline timings and to publish the processed stream to the dashboard.
