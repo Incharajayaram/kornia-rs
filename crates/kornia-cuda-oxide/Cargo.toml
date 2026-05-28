@@ -1,0 +1,36 @@
+# Sub-workspace: kornia-cuda-oxide lives in its own resolver scope so the
+# cuda-oxide dep tree (cuda-core + cuda-bindings via bindgen + cuda-device's
+# nightly-only #[kernel] macro expansion) doesn't force re-resolution of the
+# main kornia-rs workspace.
+#
+# Build with:
+#   cargo oxide build --release   # invokes the rustc-codegen-cuda backend
+# Or for examples:
+#   cargo oxide run --release --example smoke
+[workspace]
+
+[package]
+name = "kornia-cuda-oxide"
+version = "0.1.0"
+authors = ["kornia.org"]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/kornia/kornia-rs"
+description = "cuda-oxide GPU kernels for kornia-rs (prototype — Goal-5 backend bake-off vs kornia-cubecl)"
+
+[dependencies]
+# cuda-oxide: device-side intrinsics (#[kernel], thread::*, DisjointSlice)
+cuda-device = { path = "../../../cuda-oxide/crates/cuda-device" }
+# cuda-oxide: host-side glue (#[cuda_module] expansion, embedded PTX loader)
+cuda-host   = { path = "../../../cuda-oxide/crates/cuda-host" }
+# cuda-oxide: host runtime (CudaContext, DeviceBuffer, LaunchConfig, streams)
+cuda-core   = { path = "../../../cuda-oxide/crates/cuda-core" }
+
+kornia-image = { path = "../kornia-image" }
+seq-macro = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+kornia-imgproc = { path = "../kornia-imgproc" }
+kornia-tensor  = { path = "../kornia-tensor" }
+rand = "0.9"

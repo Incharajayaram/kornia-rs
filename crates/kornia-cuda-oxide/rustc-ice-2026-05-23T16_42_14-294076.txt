@@ -1,0 +1,66 @@
+thread 'rustc' panicked at /home/incharanew/.cargo/git/checkouts/pliron-0503ec41b1c0f089/b51e73b/src/operation.rs:526:9:
+Operation with use(s) being erased
+stack backtrace:
+   0:     0x76edd7d99bab - <std[ca0b0bcade21542d]::backtrace::Backtrace>::create
+   1:     0x76edd7d99af5 - <std[ca0b0bcade21542d]::backtrace::Backtrace>::force_capture
+   2:     0x76edd6db086b - std[ca0b0bcade21542d]::panicking::update_hook::<alloc[1873db2efb56cea0]::boxed::Box<rustc_driver_impl[a544dc0f85200ca5]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x76edd7dac6a2 - std[ca0b0bcade21542d]::panicking::panic_with_hook
+   4:     0x76edd7d8f0ba - std[ca0b0bcade21542d]::panicking::panic_handler::{closure#0}
+   5:     0x76edd7d835d9 - std[ca0b0bcade21542d]::sys::backtrace::__rust_end_short_backtrace::<std[ca0b0bcade21542d]::panicking::panic_handler::{closure#0}, !>
+   6:     0x76edd7d90aed - __rustc[2170a97d85da7901]::rust_begin_unwind
+   7:     0x76edd48a3d7c - core[db70abf3441067d4]::panicking::panic_fmt
+   8:     0x76edc5a51211 - <pliron[5b2e9dfb03be23d7]::operation::Operation>::erase
+                               at /home/incharanew/.cargo/git/checkouts/pliron-0503ec41b1c0f089/b51e73b/src/operation.rs:526:9
+   9:     0x76edc5b0e391 - <pliron[5b2e9dfb03be23d7]::irbuild::rewriter::IRRewriter<pliron[5b2e9dfb03be23d7]::irbuild::listener::Recorder> as pliron[5b2e9dfb03be23d7]::irbuild::rewriter::Rewriter<pliron[5b2e9dfb03be23d7]::irbuild::listener::Recorder>>::erase_operation
+                               at /home/incharanew/.cargo/git/checkouts/pliron-0503ec41b1c0f089/b51e73b/src/irbuild/rewriter.rs:258:9
+  10:     0x76edc4c6bb01 - mir_lower[d5346d8f8c4cad1b]::convert::ops::call::convert
+                               at /home/incharanew/Downloads/cuda-oxide/crates/mir-lower/src/convert/ops/call.rs:413:18
+  11:     0x76edc4c8cda3 - <dialect_mir[b87c7498575321d]::ops::call::MirCallOp as mir_lower[d5346d8f8c4cad1b]::conversion_interface::MirToLlvmConversion>::convert
+                               at /home/incharanew/Downloads/cuda-oxide/crates/mir-lower/src/convert/interface_impls.rs:775:9
+  12:     0x76edc4c3f5c2 - <mir_lower[d5346d8f8c4cad1b]::MirToLlvmConversionDriver as pliron[5b2e9dfb03be23d7]::irbuild::dialect_conversion::DialectConversion>::rewrite
+                               at /home/incharanew/Downloads/cuda-oxide/crates/mir-lower/src/lib.rs:257:19
+  13:     0x76edc4cd392e - <pliron[5b2e9dfb03be23d7]::irbuild::dialect_conversion::apply_dialect_conversion::Driver<mir_lower[d5346d8f8c4cad1b]::MirToLlvmConversionDriver>>::process_operation
+                               at /home/incharanew/.cargo/git/checkouts/pliron-0503ec41b1c0f089/b51e73b/src/irbuild/dialect_conversion.rs:453:18
+  14:     0x76edc4cd5978 - <pliron[5b2e9dfb03be23d7]::irbuild::dialect_conversion::apply_dialect_conversion::Driver<mir_lower[d5346d8f8c4cad1b]::MirToLlvmConversionDriver>>::run
+                               at /home/incharanew/.cargo/git/checkouts/pliron-0503ec41b1c0f089/b51e73b/src/irbuild/dialect_conversion.rs:469:30
+  15:     0x76edc4cd1e9f - pliron[5b2e9dfb03be23d7]::irbuild::dialect_conversion::apply_dialect_conversion::<mir_lower[d5346d8f8c4cad1b]::MirToLlvmConversionDriver>
+                               at /home/incharanew/.cargo/git/checkouts/pliron-0503ec41b1c0f089/b51e73b/src/irbuild/dialect_conversion.rs:479:12
+  16:     0x76edc4c3ee55 - mir_lower[d5346d8f8c4cad1b]::lower_mir_to_llvm
+                               at /home/incharanew/Downloads/cuda-oxide/crates/mir-lower/src/lib.rs:281:5
+  17:     0x76edc4bc1ae5 - mir_importer[27c7f0dd319bd8a8]::pipeline::lower_to_llvm
+                               at /home/incharanew/Downloads/cuda-oxide/crates/mir-importer/src/pipeline.rs:508:5
+  18:     0x76edc4bbf94a - mir_importer[27c7f0dd319bd8a8]::pipeline::run_pipeline
+                               at /home/incharanew/Downloads/cuda-oxide/crates/mir-importer/src/pipeline.rs:313:5
+  19:     0x76edc49a9451 - rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code::{closure#2}
+                               at /home/incharanew/Downloads/cuda-oxide/crates/rustc-codegen-cuda/src/device_codegen.rs:456:9
+  20:     0x76edc49d563a - rustc_public[c454ba8507116990]::rustc_internal::run::<rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code::{closure#2}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>::{closure#0}
+                               at /home/incharanew/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_public/src/rustc_internal/mod.rs:79:60
+  21:     0x76edc49b498f - rustc_public[c454ba8507116990]::compiler_interface::run::<rustc_public[c454ba8507116990]::rustc_internal::run<rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code::{closure#2}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>::{closure#0}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>::{closure#0}
+                               at /home/incharanew/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_public/src/compiler_interface.rs:876:40
+  22:     0x76edc49c16ca - <scoped_tls[c1c2816104bc9002]::ScopedKey<core[db70abf3441067d4]::cell::Cell<*const ()>>>::set::<rustc_public[c454ba8507116990]::compiler_interface::run<rustc_public[c454ba8507116990]::rustc_internal::run<rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code::{closure#2}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>::{closure#0}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>::{closure#0}, core[db70abf3441067d4]::result::Result<core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>, rustc_public[c454ba8507116990]::error::Error>>
+                               at /rust/deps/scoped-tls-1.0.1/src/lib.rs:137:9
+  23:     0x76edc49b483f - rustc_public[c454ba8507116990]::compiler_interface::run::<rustc_public[c454ba8507116990]::rustc_internal::run<rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code::{closure#2}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>::{closure#0}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>
+                               at /home/incharanew/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_public/src/compiler_interface.rs:876:13
+  24:     0x76edc49d540c - rustc_public[c454ba8507116990]::rustc_internal::run::<rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code::{closure#2}, core[db70abf3441067d4]::result::Result<mir_importer[27c7f0dd319bd8a8]::pipeline::CompilationResult, mir_importer[27c7f0dd319bd8a8]::pipeline::PipelineError>>
+                               at /home/incharanew/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/rustc-src/rust/compiler/rustc_public/src/rustc_internal/mod.rs:79:5
+  25:     0x76edc49de947 - rustc_codegen_cuda[f473327eba2df74d]::device_codegen::generate_device_code
+                               at /home/incharanew/Downloads/cuda-oxide/crates/rustc-codegen-cuda/src/device_codegen.rs:413:18
+  26:     0x76edc49c656c - <rustc_codegen_cuda[f473327eba2df74d]::CudaCodegenBackend as rustc_codegen_ssa[f60af1802d65b892]::traits::backend::CodegenBackend>::codegen_crate
+                               at /home/incharanew/Downloads/cuda-oxide/crates/rustc-codegen-cuda/src/lib.rs:531:23
+  27:     0x76edd95fe9b2 - <rustc_interface[e25ca096212c0b43]::queries::Linker>::codegen_and_build_linker
+  28:     0x76edd95f954d - rustc_interface[e25ca096212c0b43]::interface::run_compiler::<(), rustc_driver_impl[a544dc0f85200ca5]::run_compiler::{closure#0}>::{closure#1}
+  29:     0x76edd95e2ffe - std[ca0b0bcade21542d]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[e25ca096212c0b43]::util::run_in_thread_with_globals<rustc_interface[e25ca096212c0b43]::util::run_in_thread_pool_with_globals<rustc_interface[e25ca096212c0b43]::interface::run_compiler<(), rustc_driver_impl[a544dc0f85200ca5]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  30:     0x76edd95e38a0 - <std[ca0b0bcade21542d]::thread::lifecycle::spawn_unchecked<rustc_interface[e25ca096212c0b43]::util::run_in_thread_with_globals<rustc_interface[e25ca096212c0b43]::util::run_in_thread_pool_with_globals<rustc_interface[e25ca096212c0b43]::interface::run_compiler<(), rustc_driver_impl[a544dc0f85200ca5]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[db70abf3441067d4]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  31:     0x76edd95e472c - <std[ca0b0bcade21542d]::sys::thread::unix::Thread>::new::thread_start
+  32:     0x76edd2e94ac3 - start_thread
+                               at ./nptl/pthread_create.c:442:8
+  33:     0x76edd2f268d0 - __GI___clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:81:0
+  34:                0x0 - <unknown>
+
+
+rustc version: 1.96.0-nightly (55e86c996 2026-04-02)
+platform: x86_64-unknown-linux-gnu
+
+query stack during panic:
+end of query stack
