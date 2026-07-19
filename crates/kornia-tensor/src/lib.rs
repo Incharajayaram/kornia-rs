@@ -180,8 +180,8 @@ pub mod cuda;
 
 #[cfg(feature = "cuda")]
 pub use crate::cuda::{
-    pinned_alloc, uninit_cuda, zeros_cuda, zeros_pinned, CudaAllocator, CudaError, CudaKernel,
-    CudaLaunchBuilder, PinnedAllocator, PinnedResource,
+    is_integrated_device, pinned_alloc, uninit_cuda, zeros_cuda, zeros_pinned, CudaAllocator,
+    CudaError, CudaKernel, CudaLaunchBuilder, PinnedAllocator, PinnedResource,
 };
 
 /// Storage module containing low-level memory buffer implementations.

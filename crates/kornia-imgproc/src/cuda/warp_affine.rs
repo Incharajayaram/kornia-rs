@@ -672,3 +672,399 @@ pub fn launch_warp_affine_lanczos_cuda(
         )
         .map_err(|e| CudaWarpAffineError::Cuda(e.to_string()))
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+// ── Parity tests (GPU kernel vs CPU reference) ────────────────────────────────
+//
+// Each test runs both the GPU kernel and an exact CPU reference that replicates
+// the kernel's border-handling convention, then asserts element-wise agreement
+// within a small tolerance that accounts for f32 accumulation.
+//
+// Border conventions (must match the GPU kernels exactly):
+//   bilinear : manual bilinear; OOB taps contribute 0 (texture border mode)
+//   nearest  : roundf; OOB → 0 (texture border mode)
+//   bicubic  : center OOB → zero-fill; taps clamped to [0, src-1]
+//   lanczos  : center OOB → zero-fill; taps clamped; weights normalised per axis
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use cudarc::driver::{CudaContext, CudaSlice};
+
+    use super::{
+        launch_warp_affine_bicubic_cuda, launch_warp_affine_bilinear_cuda,
+        launch_warp_affine_lanczos_cuda, launch_warp_affine_nearest_cuda,
+        CudaWarpAffineError,
+    };
+    use crate::warp::invert_affine_transform;
+
+    fn default_stream() -> Arc<cudarc::driver::CudaStream> {
+        let ctx = Arc::new(CudaContext::new(0).expect("CUDA context"));
+        ctx.default_stream()
+    }
+
+    // A rotation matrix (src→dst forward convention) around the image centre.
+    fn rotation_matrix(w: u32, h: u32, angle_deg: f32) -> [f32; 6] {
+        let cx = (w as f32 - 1.0) * 0.5;
+        let cy = (h as f32 - 1.0) * 0.5;
+        let rad = angle_deg.to_radians();
+        let cos = rad.cos();
+        let sin = rad.sin();
+        [
+            cos, -sin, cx - cos * cx + sin * cy,
+            sin,  cos, cy - sin * cx - cos * cy,
+        ]
+    }
+
+    fn gpu_out(
+        stream: &Arc<cudarc::driver::CudaStream>,
+        src: &[f32],
+        src_w: u32, src_h: u32,
+        dst_w: u32, dst_h: u32,
+        m: &[f32; 6],
+        launch: impl Fn(
+            &Arc<CudaContext>, &Arc<cudarc::driver::CudaStream>,
+            &CudaSlice<f32>, &mut CudaSlice<f32>,
+            u32, u32, u32, u32, &[f32; 6], Option<(u32, u32)>,
+        ) -> Result<(), CudaWarpAffineError>,
+    ) -> Vec<f32> {
+        let ctx = stream.context().clone();
+        let d_src = stream.clone_htod(src).unwrap();
+        let mut d_dst = stream
+            .alloc_zeros::<f32>(dst_w as usize * dst_h as usize * 3)
+            .unwrap();
+        launch(&ctx, stream, &d_src, &mut d_dst, src_w, src_h, dst_w, dst_h, m, None).unwrap();
+        let out = stream.clone_dtoh(&d_dst).unwrap();
+        stream.synchronize().unwrap();
+        out
+    }
+
+    // ── CPU references ────────────────────────────────────────────────────────
+    //
+    // These exactly replicate each kernel's border handling so the comparison
+    // is fair even near image edges.
+
+    #[inline]
+    fn border_sample(src: &[f32], src_w: usize, src_h: usize, xi: i32, yi: i32, c: usize) -> f32 {
+        if xi < 0 || yi < 0 || xi >= src_w as i32 || yi >= src_h as i32 {
+            0.0
+        } else {
+            src[(yi as usize * src_w + xi as usize) * 3 + c]
+        }
+    }
+
+    #[inline]
+    fn clamp_sample(src: &[f32], src_w: usize, src_h: usize, xi: i32, yi: i32, c: usize) -> f32 {
+        let xi = xi.clamp(0, src_w as i32 - 1);
+        let yi = yi.clamp(0, src_h as i32 - 1);
+        src[(yi as usize * src_w + xi as usize) * 3 + c]
+    }
+
+    fn cpu_bilinear(
+        src: &[f32], src_w: usize, src_h: usize,
+        dst_w: usize, dst_h: usize, m: &[f32; 6],
+    ) -> Vec<f32> {
+        let mi = invert_affine_transform(m);
+        let mut out = vec![0.0_f32; dst_w * dst_h * 3];
+        for gy in 0..dst_h {
+            for gx in 0..dst_w {
+                let sx = mi[0] * gx as f32 + mi[1] * gy as f32 + mi[2];
+                let sy = mi[3] * gx as f32 + mi[4] * gy as f32 + mi[5];
+                let x0 = sx.floor() as i32;
+                let y0 = sy.floor() as i32;
+                let fx = sx - sx.floor();
+                let fy = sy - sy.floor();
+                let w00 = (1.0 - fy) * (1.0 - fx);
+                let w10 = (1.0 - fy) * fx;
+                let w01 = fy * (1.0 - fx);
+                let w11 = fy * fx;
+                let oi = (gy * dst_w + gx) * 3;
+                for c in 0..3 {
+                    out[oi + c] = w00 * border_sample(src, src_w, src_h, x0,   y0,   c)
+                                + w10 * border_sample(src, src_w, src_h, x0+1, y0,   c)
+                                + w01 * border_sample(src, src_w, src_h, x0,   y0+1, c)
+                                + w11 * border_sample(src, src_w, src_h, x0+1, y0+1, c);
+                }
+            }
+        }
+        out
+    }
+
+    fn cpu_nearest(
+        src: &[f32], src_w: usize, src_h: usize,
+        dst_w: usize, dst_h: usize, m: &[f32; 6],
+    ) -> Vec<f32> {
+        let mi = invert_affine_transform(m);
+        let mut out = vec![0.0_f32; dst_w * dst_h * 3];
+        for gy in 0..dst_h {
+            for gx in 0..dst_w {
+                let sx = mi[0] * gx as f32 + mi[1] * gy as f32 + mi[2];
+                let sy = mi[3] * gx as f32 + mi[4] * gy as f32 + mi[5];
+                let xi = sx.round() as i32;
+                let yi = sy.round() as i32;
+                let oi = (gy * dst_w + gx) * 3;
+                for c in 0..3 {
+                    out[oi + c] = border_sample(src, src_w, src_h, xi, yi, c);
+                }
+            }
+        }
+        out
+    }
+
+    // Cubic weight: Keys a=-0.5, same Horner form as the GPU kernel.
+    #[inline]
+    fn cubic_w(t: f32) -> f32 {
+        let t = t.abs();
+        if t < 1.0 {
+            (1.5 * t - 2.5) * t * t + 1.0
+        } else if t < 2.0 {
+            ((-0.5 * t + 2.5) * t - 4.0) * t + 2.0
+        } else {
+            0.0
+        }
+    }
+
+    fn cpu_bicubic(
+        src: &[f32], src_w: usize, src_h: usize,
+        dst_w: usize, dst_h: usize, m: &[f32; 6],
+    ) -> Vec<f32> {
+        let mi = invert_affine_transform(m);
+        let mut out = vec![0.0_f32; dst_w * dst_h * 3];
+        for gy in 0..dst_h {
+            for gx in 0..dst_w {
+                let sx = mi[0] * gx as f32 + mi[1] * gy as f32 + mi[2];
+                let sy = mi[3] * gx as f32 + mi[4] * gy as f32 + mi[5];
+                let oi = (gy * dst_w + gx) * 3;
+                if sx < 0.0 || sx >= src_w as f32 || sy < 0.0 || sy >= src_h as f32 {
+                    // zero already
+                    continue;
+                }
+                let x0 = sx.floor() as i32;
+                let y0 = sy.floor() as i32;
+                let fx = sx - x0 as f32;
+                let fy = sy - y0 as f32;
+                // Horner-form weights matching GPU exactly.
+                let wx = [
+                    cubic_w(1.0 + fx), cubic_w(fx), cubic_w(1.0 - fx), cubic_w(2.0 - fx),
+                ];
+                let wy = [
+                    cubic_w(1.0 + fy), cubic_w(fy), cubic_w(1.0 - fy), cubic_w(2.0 - fy),
+                ];
+                let mut acc = [0.0_f32; 3];
+                for dy in 0..4i32 {
+                    let yi = (y0 + dy - 1).clamp(0, src_h as i32 - 1);
+                    for dx in 0..4i32 {
+                        let xi = (x0 + dx - 1).clamp(0, src_w as i32 - 1);
+                        let w = wx[dx as usize] * wy[dy as usize];
+                        for c in 0..3 {
+                            acc[c] += w * clamp_sample(src, src_w, src_h, xi, yi, c);
+                        }
+                    }
+                }
+                for c in 0..3 {
+                    out[oi + c] = acc[c];
+                }
+            }
+        }
+        out
+    }
+
+    fn lanczos3_w(x: f32) -> f32 {
+        let ax = x.abs();
+        if ax < 1e-5 { return 1.0; }
+        if ax >= 3.0 { return 0.0; }
+        let pi = std::f32::consts::PI;
+        let pix = pi * x;
+        let pix3 = pix / 3.0;
+        pix.sin() * pix3.sin() / (pix * pix3)
+    }
+
+    fn cpu_lanczos(
+        src: &[f32], src_w: usize, src_h: usize,
+        dst_w: usize, dst_h: usize, m: &[f32; 6],
+    ) -> Vec<f32> {
+        let mi = invert_affine_transform(m);
+        let mut out = vec![0.0_f32; dst_w * dst_h * 3];
+        for gy in 0..dst_h {
+            for gx in 0..dst_w {
+                let sx = mi[0] * gx as f32 + mi[1] * gy as f32 + mi[2];
+                let sy = mi[3] * gx as f32 + mi[4] * gy as f32 + mi[5];
+                let oi = (gy * dst_w + gx) * 3;
+                if sx < 0.0 || sx >= src_w as f32 || sy < 0.0 || sy >= src_h as f32 {
+                    continue;
+                }
+                let x0 = sx.floor() as i32;
+                let y0 = sy.floor() as i32;
+                let frac_x = sx - x0 as f32;
+                let frac_y = sy - y0 as f32;
+                let mut wx = [
+                    lanczos3_w(frac_x + 2.0), lanczos3_w(frac_x + 1.0),
+                    lanczos3_w(frac_x),       lanczos3_w(frac_x - 1.0),
+                    lanczos3_w(frac_x - 2.0), lanczos3_w(frac_x - 3.0),
+                ];
+                let mut wy = [
+                    lanczos3_w(frac_y + 2.0), lanczos3_w(frac_y + 1.0),
+                    lanczos3_w(frac_y),       lanczos3_w(frac_y - 1.0),
+                    lanczos3_w(frac_y - 2.0), lanczos3_w(frac_y - 3.0),
+                ];
+                let sum_wx: f32 = wx.iter().sum();
+                let sum_wy: f32 = wy.iter().sum();
+                let inv_x = 1.0 / sum_wx;
+                let inv_y = 1.0 / sum_wy;
+                for w in &mut wx { *w *= inv_x; }
+                for w in &mut wy { *w *= inv_y; }
+                let mut acc = [0.0_f32; 3];
+                for dy in 0..6i32 {
+                    let yi = (y0 + dy - 2).clamp(0, src_h as i32 - 1);
+                    let mut row_acc = [0.0_f32; 3];
+                    for dx in 0..6i32 {
+                        let xi = (x0 + dx - 2).clamp(0, src_w as i32 - 1);
+                        for c in 0..3 {
+                            row_acc[c] += wx[dx as usize] * clamp_sample(src, src_w, src_h, xi, yi, c);
+                        }
+                    }
+                    for c in 0..3 { acc[c] += wy[dy as usize] * row_acc[c]; }
+                }
+                for c in 0..3 { out[oi + c] = acc[c]; }
+            }
+        }
+        out
+    }
+
+    fn assert_close(gpu: &[f32], cpu: &[f32], atol: f32, label: &str) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: length mismatch");
+        let mut first_fail = None;
+        let mut max_err = 0.0_f32;
+        for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
+            let e = (g - c).abs();
+            if e > max_err { max_err = e; }
+            if e > atol && first_fail.is_none() {
+                first_fail = Some((i, *g, *c));
+            }
+        }
+        if let Some((i, g, c)) = first_fail {
+            panic!("{label}: first mismatch at {i}: gpu={g} cpu={c}; max_err={max_err} (atol={atol})");
+        }
+    }
+
+    fn checkerboard(w: usize, h: usize) -> Vec<f32> {
+        (0..w * h * 3)
+            .map(|i| {
+                let pixel = i / 3;
+                let row = pixel / w;
+                let col = pixel % w;
+                if (row + col) % 2 == 0 { 0.8 } else { 0.2 }
+            })
+            .collect()
+    }
+
+    // ── bilinear ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bilinear_identity_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_bilinear_cuda);
+        let cpu = cpu_bilinear(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 1e-5, "bilinear_identity");
+    }
+
+    #[test]
+    fn bilinear_translation_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = [1.0, 0.0, 4.0, 0.0, 1.0, 3.0];
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_bilinear_cuda);
+        let cpu = cpu_bilinear(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 1e-5, "bilinear_translation");
+    }
+
+    #[test]
+    fn bilinear_rotation45_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = rotation_matrix(w, h, 45.0);
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_bilinear_cuda);
+        let cpu = cpu_bilinear(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 2e-5, "bilinear_rotation45");
+    }
+
+    // ── nearest ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nearest_identity_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_nearest_cuda);
+        let cpu = cpu_nearest(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 0.0, "nearest_identity");
+    }
+
+    #[test]
+    fn nearest_rotation90_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = rotation_matrix(w, h, 90.0);
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_nearest_cuda);
+        let cpu = cpu_nearest(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 0.0, "nearest_rotation90");
+    }
+
+    // ── bicubic ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bicubic_identity_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_bicubic_cuda);
+        let cpu = cpu_bicubic(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 2e-5, "bicubic_identity");
+    }
+
+    #[test]
+    fn bicubic_rotation30_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = rotation_matrix(w, h, 30.0);
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_bicubic_cuda);
+        let cpu = cpu_bicubic(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 2e-4, "bicubic_rotation30");
+    }
+
+    // ── Lanczos-3 ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lanczos_identity_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_lanczos_cuda);
+        let cpu = cpu_lanczos(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        // __sinf/__fdividef fast-math vs f32 std: up to ~5e-4 per tap over 36 taps.
+        assert_close(&gpu, &cpu, 5e-3, "lanczos_identity");
+    }
+
+    #[test]
+    fn lanczos_rotation30_matches_cpu() {
+        let stream = default_stream();
+        let (w, h) = (64u32, 64u32);
+        let src = checkerboard(w as usize, h as usize);
+        let m = rotation_matrix(w, h, 30.0);
+        let gpu = gpu_out(&stream, &src, w, h, w, h, &m, launch_warp_affine_lanczos_cuda);
+        let cpu = cpu_lanczos(&src, w as usize, h as usize, w as usize, h as usize, &m);
+        assert_close(&gpu, &cpu, 5e-3, "lanczos_rotation30");
+    }
+}

@@ -55,6 +55,7 @@ use std::{
 };
 
 use cudarc::driver::{
+    sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED,
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DeviceRepr,
     LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
@@ -559,6 +560,23 @@ impl<'a> CudaLaunchBuilder<'a> {
             .map(|_| ())
             .map_err(|e| CudaError::Driver(e.to_string()))
     }
+}
+
+// ── Device capability helpers ─────────────────────────────────────────────────
+
+/// Returns `true` if the device backing `ctx` is an integrated GPU (e.g. Jetson).
+///
+/// On integrated SoCs (Jetson Orin, Xavier, …) device and host share physical
+/// DRAM, so managed/unified memory ([`cuMemAllocManaged`]) eliminates the
+/// explicit H↔D copies that are needed on discrete GPUs.  Call this once at
+/// startup to decide whether to use `CudaContext::alloc_unified` for zero-copy
+/// buffers.
+///
+/// Returns `false` on any error (attribute query failure counts as discrete).
+pub fn is_integrated_device(ctx: &Arc<CudaContext>) -> bool {
+    ctx.attribute(CU_DEVICE_ATTRIBUTE_INTEGRATED)
+        .map(|v| v != 0)
+        .unwrap_or(false)
 }
 
 // ── zeros_cuda ────────────────────────────────────────────────────────────────
