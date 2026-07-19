@@ -874,3 +874,360 @@ pub fn launch_resize_lanczos_cuda(
         )
         .map_err(|e| CudaResizeError::Cuda(e.to_string()))
 }
+
+// ── Parity tests (GPU kernel vs CPU reference) ────────────────────────────────
+//
+// Each CPU reference replicates the kernel's exact coordinate convention:
+//   half-pixel center: sx = clamp((dst_x + 0.5) * scale_x − 0.5, 0, src_w−1)
+//
+// Bilinear / normalize taps: clamp x0+1 to src_w−1 (no border-zero blending).
+// Bicubic taps: clamped to [0, src−1].
+// Lanczos: separable 2-pass H then V, each pass clamped + weight-normalised.
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use cudarc::driver::CudaContext;
+
+    use super::{
+        launch_resize_bicubic_cuda, launch_resize_bilinear_downscale_cuda,
+        launch_resize_bilinear_normalize_cuda, launch_resize_lanczos_cuda,
+        launch_resize_nearest_downscale_cuda,
+    };
+
+    fn default_stream() -> Arc<cudarc::driver::CudaStream> {
+        let ctx = Arc::new(CudaContext::new(0).expect("CUDA context"));
+        ctx.default_stream()
+    }
+
+    fn ramp(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i % 256) as f32 / 255.0).collect()
+    }
+
+    fn assert_close(gpu: &[f32], cpu: &[f32], atol: f32, label: &str) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: length mismatch");
+        let mut max_err = 0.0_f32;
+        let mut first_fail = None;
+        for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
+            let e = (g - c).abs();
+            if e > max_err { max_err = e; }
+            if e > atol && first_fail.is_none() { first_fail = Some((i, *g, *c)); }
+        }
+        if let Some((i, g, c)) = first_fail {
+            panic!("{label}: first mismatch at {i}: gpu={g} cpu={c} max_err={max_err} (atol={atol})");
+        }
+    }
+
+    // ── CPU references ────────────────────────────────────────────────────────
+
+    fn half_px_coord(dst_i: usize, scale: f32, src_len: usize) -> f32 {
+        let s = (dst_i as f32 + 0.5) * scale - 0.5;
+        s.max(0.0).min(src_len as f32 - 1.0)
+    }
+
+    fn clamp_idx(i: i32, len: usize) -> usize {
+        i.clamp(0, len as i32 - 1) as usize
+    }
+
+    fn cpu_bilinear(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let scale_x = sw as f32 / dw as f32;
+        let scale_y = sh as f32 / dh as f32;
+        let mut out = vec![0.0_f32; dw * dh * 3];
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let sx = half_px_coord(dx, scale_x, sw);
+                let sy = half_px_coord(dy, scale_y, sh);
+                let x0 = sx as usize;
+                let y0 = sy as usize;
+                let x1 = (x0 + 1).min(sw - 1);
+                let y1 = (y0 + 1).min(sh - 1);
+                let fx = sx - x0 as f32;
+                let fy = sy - y0 as f32;
+                let w00 = (1.0 - fy) * (1.0 - fx);
+                let w10 = (1.0 - fy) * fx;
+                let w01 = fy * (1.0 - fx);
+                let w11 = fy * fx;
+                let oi = (dy * dw + dx) * 3;
+                for c in 0..3 {
+                    out[oi + c] = w00 * src[(y0 * sw + x0) * 3 + c]
+                        + w10 * src[(y0 * sw + x1) * 3 + c]
+                        + w01 * src[(y1 * sw + x0) * 3 + c]
+                        + w11 * src[(y1 * sw + x1) * 3 + c];
+                }
+            }
+        }
+        out
+    }
+
+    fn cpu_nearest(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let scale_x = sw as f32 / dw as f32;
+        let scale_y = sh as f32 / dh as f32;
+        let mut out = vec![0.0_f32; dw * dh * 3];
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let xi = ((dx as f32 + 0.5) * scale_x) as usize;
+                let yi = ((dy as f32 + 0.5) * scale_y) as usize;
+                let xi = xi.min(sw - 1);
+                let yi = yi.min(sh - 1);
+                let oi = (dy * dw + dx) * 3;
+                for c in 0..3 {
+                    out[oi + c] = src[(yi * sw + xi) * 3 + c];
+                }
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn cubic_w(t: f32) -> f32 {
+        let t = t.abs();
+        if t < 1.0 { (1.5 * t - 2.5) * t * t + 1.0 }
+        else if t < 2.0 { ((-0.5 * t + 2.5) * t - 4.0) * t + 2.0 }
+        else { 0.0 }
+    }
+
+    fn cpu_bicubic(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let scale_x = sw as f32 / dw as f32;
+        let scale_y = sh as f32 / dh as f32;
+        let mut out = vec![0.0_f32; dw * dh * 3];
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let sx = half_px_coord(dx, scale_x, sw);
+                let sy = half_px_coord(dy, scale_y, sh);
+                let x0 = sx.floor() as i32;
+                let y0 = sy.floor() as i32;
+                let fx = sx - x0 as f32;
+                let fy = sy - y0 as f32;
+                let wx = [cubic_w(1.0+fx), cubic_w(fx), cubic_w(1.0-fx), cubic_w(2.0-fx)];
+                let wy = [cubic_w(1.0+fy), cubic_w(fy), cubic_w(1.0-fy), cubic_w(2.0-fy)];
+                let mut acc = [0.0_f32; 3];
+                for (dy2, &wy_v) in wy.iter().enumerate() {
+                    let yi = clamp_idx(y0 + dy2 as i32 - 1, sh);
+                    for (dx2, &wx_v) in wx.iter().enumerate() {
+                        let xi = clamp_idx(x0 + dx2 as i32 - 1, sw);
+                        let w = wx_v * wy_v;
+                        for c in 0..3 { acc[c] += w * src[(yi * sw + xi) * 3 + c]; }
+                    }
+                }
+                let oi = (dy * dw + dx) * 3;
+                for c in 0..3 { out[oi + c] = acc[c]; }
+            }
+        }
+        out
+    }
+
+    fn lanczos3_w(x: f32) -> f32 {
+        let ax = x.abs();
+        if ax < 1e-5 { return 1.0; }
+        if ax >= 3.0 { return 0.0; }
+        let pi = std::f32::consts::PI;
+        let pix = pi * x;
+        let pix3 = pix / 3.0;
+        pix.sin() * pix3.sin() / (pix * pix3)
+    }
+
+    fn cpu_lanczos(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let scale_x = sw as f32 / dw as f32;
+        let scale_y = sh as f32 / dh as f32;
+
+        // H pass: (dw, sh, 3)
+        let mut inter = vec![0.0_f32; dw * sh * 3];
+        for sy in 0..sh {
+            for dx in 0..dw {
+                let sx = half_px_coord(dx, scale_x, sw);
+                let x0 = sx.floor() as i32;
+                let frac = sx - x0 as f32;
+                let mut wx = [
+                    lanczos3_w(frac + 2.0), lanczos3_w(frac + 1.0),
+                    lanczos3_w(frac),       lanczos3_w(frac - 1.0),
+                    lanczos3_w(frac - 2.0), lanczos3_w(frac - 3.0),
+                ];
+                let sum: f32 = wx.iter().sum();
+                let inv = 1.0 / sum;
+                for w in &mut wx { *w *= inv; }
+                let row = sy * sw * 3;
+                let mut acc = [0.0_f32; 3];
+                for (i, &w) in wx.iter().enumerate() {
+                    let xi = clamp_idx(x0 + i as i32 - 2, sw);
+                    for c in 0..3 { acc[c] += w * src[row + xi * 3 + c]; }
+                }
+                let oi = (sy * dw + dx) * 3;
+                for c in 0..3 { inter[oi + c] = acc[c]; }
+            }
+        }
+
+        // V pass: (dw, dh, 3)
+        let mut out = vec![0.0_f32; dw * dh * 3];
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let sy = half_px_coord(dy, scale_y, sh);
+                let y0 = sy.floor() as i32;
+                let frac = sy - y0 as f32;
+                let mut wy = [
+                    lanczos3_w(frac + 2.0), lanczos3_w(frac + 1.0),
+                    lanczos3_w(frac),       lanczos3_w(frac - 1.0),
+                    lanczos3_w(frac - 2.0), lanczos3_w(frac - 3.0),
+                ];
+                let sum: f32 = wy.iter().sum();
+                let inv = 1.0 / sum;
+                for w in &mut wy { *w *= inv; }
+                let mut acc = [0.0_f32; 3];
+                for (i, &w) in wy.iter().enumerate() {
+                    let yi = clamp_idx(y0 + i as i32 - 2, sh);
+                    let row = yi * dw * 3;
+                    for c in 0..3 { acc[c] += w * inter[row + dx * 3 + c]; }
+                }
+                let oi = (dy * dw + dx) * 3;
+                for c in 0..3 { out[oi + c] = acc[c]; }
+            }
+        }
+        out
+    }
+
+    fn run_gpu(
+        stream: &Arc<cudarc::driver::CudaStream>,
+        src: &[f32],
+        sw: u32, sh: u32, dw: u32, dh: u32,
+        launch: impl Fn(&Arc<cudarc::driver::CudaContext>, &Arc<cudarc::driver::CudaStream>,
+                        &cudarc::driver::CudaSlice<f32>, &mut cudarc::driver::CudaSlice<f32>,
+                        u32, u32, u32, u32, Option<(u32, u32)>) -> Result<(), super::CudaResizeError>,
+    ) -> Vec<f32> {
+        let ctx = stream.context().clone();
+        let d_src = stream.clone_htod(src).unwrap();
+        let mut d_dst = stream.alloc_zeros::<f32>(dw as usize * dh as usize * 3).unwrap();
+        launch(&ctx, stream, &d_src, &mut d_dst, sw, sh, dw, dh, None).unwrap();
+        let out = stream.clone_dtoh(&d_dst).unwrap();
+        stream.synchronize().unwrap();
+        out
+    }
+
+    // ── bilinear ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bilinear_2x_downscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (64usize, 48usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_bilinear_downscale_cuda);
+        let cpu = cpu_bilinear(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 1e-5, "bilinear_2x_downscale");
+    }
+
+    #[test]
+    fn bilinear_asymmetric_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (96usize, 72usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_bilinear_downscale_cuda);
+        let cpu = cpu_bilinear(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 1e-5, "bilinear_asymmetric");
+    }
+
+    // ── nearest ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nearest_2x_downscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (64usize, 48usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_nearest_downscale_cuda);
+        let cpu = cpu_nearest(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 0.0, "nearest_2x_downscale");
+    }
+
+    #[test]
+    fn nearest_3x_downscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (96usize, 72usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_nearest_downscale_cuda);
+        let cpu = cpu_nearest(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 0.0, "nearest_3x_downscale");
+    }
+
+    // ── bilinear + normalize ──────────────────────────────────────────────────
+
+    #[test]
+    fn bilinear_normalize_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (64usize, 48usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let mean = [0.485, 0.456, 0.406];
+        let std = [0.229, 0.224, 0.225];
+
+        let ctx = stream.context().clone();
+        let d_src = stream.clone_htod(&src).unwrap();
+        let mut d_dst = stream.alloc_zeros::<f32>(dw * dh * 3).unwrap();
+        launch_resize_bilinear_normalize_cuda(
+            &ctx, &stream, &d_src, &mut d_dst,
+            sw as u32, sh as u32, dw as u32, dh as u32,
+            mean, std, None,
+        ).unwrap();
+        let gpu: Vec<f32> = stream.clone_dtoh(&d_dst).unwrap();
+        stream.synchronize().unwrap();
+
+        // CPU reference: bilinear resize then normalize.
+        let bilinear = cpu_bilinear(&src, sw, sh, dw, dh);
+        let cpu: Vec<f32> = bilinear.chunks_exact(3).flat_map(|px| [
+            (px[0] - mean[0]) / std[0],
+            (px[1] - mean[1]) / std[1],
+            (px[2] - mean[2]) / std[2],
+        ]).collect();
+
+        assert_close(&gpu, &cpu, 2e-5, "bilinear_normalize");
+    }
+
+    // ── bicubic ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bicubic_2x_downscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (64usize, 48usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_bicubic_cuda);
+        let cpu = cpu_bicubic(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 2e-5, "bicubic_2x_downscale");
+    }
+
+    #[test]
+    fn bicubic_2x_upscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (32usize, 24usize, 64usize, 48usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_bicubic_cuda);
+        let cpu = cpu_bicubic(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 2e-5, "bicubic_2x_upscale");
+    }
+
+    // ── Lanczos-3 (separable 2-pass) ─────────────────────────────────────────
+
+    #[test]
+    fn lanczos_2x_downscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (64usize, 48usize, 32usize, 24usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_lanczos_cuda);
+        let cpu = cpu_lanczos(&src, sw, sh, dw, dh);
+        // __sinf/__fdividef vs f32 std over 6 taps in 2 passes.
+        assert_close(&gpu, &cpu, 5e-3, "lanczos_2x_downscale");
+    }
+
+    #[test]
+    fn lanczos_2x_upscale_matches_cpu() {
+        let stream = default_stream();
+        let (sw, sh, dw, dh) = (32usize, 24usize, 64usize, 48usize);
+        let src = ramp(sw * sh * 3);
+        let gpu = run_gpu(&stream, &src, sw as u32, sh as u32, dw as u32, dh as u32,
+                          launch_resize_lanczos_cuda);
+        let cpu = cpu_lanczos(&src, sw, sh, dw, dh);
+        assert_close(&gpu, &cpu, 5e-3, "lanczos_2x_upscale");
+    }
+}
