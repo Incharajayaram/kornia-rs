@@ -77,6 +77,7 @@
 //! * [`launch_resize_bilinear_normalize_cuda`]  — bilinear downscale + normalise, 3-ch f32.
 //! * [`launch_resize_bicubic_cuda`]             — bicubic resize (up or down), 3-ch f32.
 //! * [`launch_resize_lanczos_cuda`]             — Lanczos-3 separable 2-pass resize (up or down), 3-ch f32.
+//! * [`launch_resize_area_cuda`]                — INTER_AREA box-average for integer downscale, 3-ch f32.
 
 use std::sync::{Arc, OnceLock};
 
@@ -417,6 +418,54 @@ extern "C" __global__ void resize_lanczos_v_3c(
 }
 "#;
 
+// ── CUDA C source: INTER_AREA (integer scale, area averaging) ─────────────────
+//
+// For integer downscale by (scale_x, scale_y), each output pixel is the exact
+// average of a scale_x × scale_y source block.  This is the correct algorithm
+// for integer downscale: no aliasing, no ringing, matches OpenCV INTER_AREA.
+//
+// Reads scale_x * scale_y source pixels per output pixel via __ldg.  The
+// access pattern is sequential within each source row → coalesced across warps.
+// L1 cache preference (PREFER_L1) is set at launch time via compile_with_l1.
+
+static AREA_SRC: &str = r#"
+extern "C" __global__ void resize_area_3c(
+    const float* __restrict__ src,
+    float* __restrict__       dst,
+    unsigned int src_w,
+    unsigned int src_h,
+    unsigned int dst_w,
+    unsigned int dst_h,
+    unsigned int scale_x,
+    unsigned int scale_y
+) {
+    unsigned int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= dst_w || gy >= dst_h) return;
+
+    float inv  = 1.0f / (float)(scale_x * scale_y);
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
+
+    unsigned int base_y = gy * scale_y;
+    unsigned int base_x = gx * scale_x;
+
+    for (unsigned int dy = 0u; dy < scale_y; ++dy) {
+        unsigned int row = (base_y + dy) * src_w;
+        for (unsigned int dx = 0u; dx < scale_x; ++dx) {
+            unsigned int b = (row + base_x + dx) * 3u;
+            sum0 += __ldg(&src[b]);
+            sum1 += __ldg(&src[b + 1u]);
+            sum2 += __ldg(&src[b + 2u]);
+        }
+    }
+
+    unsigned int out = (gy * dst_w + gx) * 3u;
+    dst[out]     = sum0 * inv;
+    dst[out + 1] = sum1 * inv;
+    dst[out + 2] = sum2 * inv;
+}
+"#;
+
 // ── Kernel caches ─────────────────────────────────────────────────────────────
 
 static BILINEAR_KERNEL: OnceLock<CudaKernel> = OnceLock::new();
@@ -425,6 +474,7 @@ static BILINEAR_NORMALIZE_KERNEL: OnceLock<CudaKernel> = OnceLock::new();
 static BICUBIC_KERNEL: OnceLock<Result<CudaKernel, String>> = OnceLock::new();
 static LANCZOS_H_KERNEL: OnceLock<Result<CudaKernel, String>> = OnceLock::new();
 static LANCZOS_V_KERNEL: OnceLock<Result<CudaKernel, String>> = OnceLock::new();
+static AREA_KERNEL: OnceLock<CudaKernel> = OnceLock::new();
 
 // 32 threads wide → full warp maps to one output row (better write coalescing).
 // 8 threads tall → 256 threads total, same occupancy as 16×16.
@@ -873,4 +923,196 @@ pub fn launch_resize_lanczos_cuda(
             make_config(dst_width, dst_height, block_dim),
         )
         .map_err(|e| CudaResizeError::Cuda(e.to_string()))
+}
+
+/// Launch an INTER_AREA box-average downscale kernel for 3-channel f32 images.
+///
+/// Each output pixel is the unweighted mean of a `scale_x × scale_y` source
+/// block — the correct algorithm for integer downscale (no aliasing, matches
+/// OpenCV `INTER_AREA`).  For non-integer or upscale ratios the function
+/// returns an error; use [`launch_resize_bilinear_downscale_cuda`] instead.
+///
+/// # Arguments
+///
+/// * `ctx`    – CUDA context used for one-time kernel compilation.
+/// * `stream` – Stream for kernel execution.
+/// * `src`    – Device slice: `src_h × src_w × 3` f32 values (channel-last RGB).
+/// * `dst`    – Device slice: `dst_h × dst_w × 3` f32 values (written on return).
+/// * `src_width`, `src_height` – Source image dimensions.
+/// * `dst_width`, `dst_height` – Output dimensions. Must evenly divide source.
+/// * `block_dim` – Optional thread-block override `(width, height)`. `None`
+///   uses the default 32×8 layout.
+///
+/// # Errors
+///
+/// Returns [`CudaResizeError::Cuda`] when source dimensions are not exact
+/// multiples of dest, scale < 2, or the kernel fails to compile or launch.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_resize_area_cuda(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<f32>,
+    dst: &mut CudaSlice<f32>,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    block_dim: Option<(u32, u32)>,
+) -> Result<(), CudaResizeError> {
+    if !src_width.is_multiple_of(dst_width) || !src_height.is_multiple_of(dst_height) {
+        return Err(CudaResizeError::Cuda(format!(
+            "INTER_AREA requires integer scale: src {src_width}×{src_height} \
+             is not an exact multiple of dst {dst_width}×{dst_height}"
+        )));
+    }
+    let scale_x = src_width / dst_width;
+    let scale_y = src_height / dst_height;
+    if scale_x < 2 || scale_y < 2 {
+        return Err(CudaResizeError::Cuda(format!(
+            "INTER_AREA requires scale ≥ 2 in both dimensions (got {scale_x}×{scale_y}); \
+             use launch_resize_bilinear_downscale_cuda for 1× or fractional scale"
+        )));
+    }
+
+    let need = (dst_width as usize) * (dst_height as usize) * 3;
+    if dst.len() < need {
+        return Err(CudaResizeError::SliceTooSmall {
+            got: dst.len(),
+            need,
+        });
+    }
+
+    let kernel = AREA_KERNEL.get_or_init(|| compile_with_l1(ctx, AREA_SRC, "resize_area_3c"));
+
+    kernel
+        .launch_builder(stream)
+        .arg(src)
+        .arg(dst)
+        .arg(&src_width)
+        .arg(&src_height)
+        .arg(&dst_width)
+        .arg(&dst_height)
+        .arg(&scale_x)
+        .arg(&scale_y)
+        .launch_2d(
+            dst_width,
+            dst_height,
+            make_config(dst_width, dst_height, block_dim),
+        )
+        .map_err(|e| CudaResizeError::Cuda(e.to_string()))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cudarc::driver::CudaContext;
+
+    fn default_stream() -> Arc<cudarc::driver::CudaStream> {
+        let ctx = Arc::new(CudaContext::new(0).expect("CUDA context"));
+        ctx.default_stream()
+    }
+
+    /// Box-average reference: average each (scale_y × scale_x) block into one dst pixel.
+    fn cpu_area_ref(
+        src: &[f32],
+        src_w: usize,
+        dst_w: usize,
+        dst_h: usize,
+        scale_x: usize,
+        scale_y: usize,
+    ) -> Vec<f32> {
+        let inv = 1.0_f32 / (scale_x * scale_y) as f32;
+        let mut out = vec![0.0_f32; dst_w * dst_h * 3];
+        for gy in 0..dst_h {
+            for gx in 0..dst_w {
+                let mut s = [0.0_f32; 3];
+                for dy in 0..scale_y {
+                    let row = (gy * scale_y + dy) * src_w;
+                    for dx in 0..scale_x {
+                        let b = (row + gx * scale_x + dx) * 3;
+                        s[0] += src[b];
+                        s[1] += src[b + 1];
+                        s[2] += src[b + 2];
+                    }
+                }
+                let o = (gy * dst_w + gx) * 3;
+                out[o] = s[0] * inv;
+                out[o + 1] = s[1] * inv;
+                out[o + 2] = s[2] * inv;
+            }
+        }
+        out
+    }
+
+    fn assert_area_matches(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) {
+        let data: Vec<f32> = (0..src_w * src_h * 3)
+            .map(|i| (i % 256) as f32 / 255.0)
+            .collect();
+        let scale_x = src_w / dst_w;
+        let scale_y = src_h / dst_h;
+        let cpu = cpu_area_ref(&data, src_w, dst_w, dst_h, scale_x, scale_y);
+
+        let stream = default_stream();
+        let ctx = stream.context().clone();
+        let d_src = stream.clone_htod(&data).unwrap();
+        let mut d_dst = stream.alloc_zeros::<f32>(dst_w * dst_h * 3).unwrap();
+
+        launch_resize_area_cuda(
+            &ctx, &stream, &d_src, &mut d_dst,
+            src_w as u32, src_h as u32, dst_w as u32, dst_h as u32, None,
+        )
+        .unwrap();
+
+        let gpu: Vec<f32> = stream.clone_dtoh(&d_dst).unwrap();
+        stream.synchronize().unwrap();
+
+        for (i, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
+            assert!(
+                (c - g).abs() <= 1e-5,
+                "area mismatch at element {i}: cpu={c} gpu={g}"
+            );
+        }
+    }
+
+    #[test]
+    fn area_2x_isotropic_matches_cpu() {
+        assert_area_matches(640, 480, 320, 240);
+    }
+
+    #[test]
+    fn area_4x_isotropic_matches_cpu() {
+        assert_area_matches(1280, 960, 320, 240);
+    }
+
+    #[test]
+    fn area_anisotropic_2x4_matches_cpu() {
+        // scale_x=2, scale_y=4
+        assert_area_matches(640, 960, 320, 240);
+    }
+
+    #[test]
+    fn area_rejects_non_integer_scale() {
+        let stream = default_stream();
+        let ctx = stream.context().clone();
+        let d_src = stream.alloc_zeros::<f32>(640 * 480 * 3).unwrap();
+        let mut d_dst = stream.alloc_zeros::<f32>(333 * 240 * 3).unwrap();
+        let err = launch_resize_area_cuda(
+            &ctx, &stream, &d_src, &mut d_dst, 640, 480, 333, 240, None,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn area_rejects_scale_less_than_2() {
+        let stream = default_stream();
+        let ctx = stream.context().clone();
+        let d_src = stream.alloc_zeros::<f32>(640 * 480 * 3).unwrap();
+        let mut d_dst = stream.alloc_zeros::<f32>(640 * 480 * 3).unwrap();
+        let err = launch_resize_area_cuda(
+            &ctx, &stream, &d_src, &mut d_dst, 640, 480, 640, 480, None,
+        );
+        assert!(err.is_err());
+    }
 }
