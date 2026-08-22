@@ -46,6 +46,11 @@ struct Args {
     /// untimed warmup iterations per case (default 5)
     #[argh(option, default = "5")]
     warmup: usize,
+
+    /// accepted and ignored: `cargo bench` passes `--bench` to the harness
+    #[argh(switch)]
+    #[allow(dead_code)]
+    bench: bool,
 }
 
 /// Resolutions to sweep, as (label, width, height).
