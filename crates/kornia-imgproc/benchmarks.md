@@ -736,3 +736,60 @@ On Jetson, **Unified Memory perfectly eliminates 100% of the PCIe transfer overh
 | 4K (3840x2160) | 111.86 ms | 105.05 ms | 79.21 ms | **1.41x** |
 
 On discrete GPUs, Unified Memory is actually **slower** or barely equivalent due to implicit PCIe page-faulting when the kernel accesses host memory. However, explicitly transferring **Pinned Write-Combined Memory** across the PCIe bus achieves up to a **1.90x speedup** over standard pageable host memory transfers because it maximizes PCIe DMA bandwidth.
+| remap (u8) | bilinear | 1920×1080 | — | — | — | — | — | — | — |
+| remap (u8) | bilinear | 3840×2160 | — | — | — | — | — | — | — |
+| remap (u8) | nearest | 1920×1080 | — | — | — | — | — | — | — |
+| remap (u8) | nearest | 3840×2160 | — | — | — | — | — | — | — |
+| gray_from_rgb (u8) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| gray_from_rgb (u8) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+| rgb_from_gray (u8) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| rgb_from_gray (u8) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+| hsv_from_rgb (f32) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| hsv_from_rgb (f32) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+| hls_from_rgb (f32) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| hls_from_rgb (f32) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+| ycc_from_rgb (u8) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| ycc_from_rgb (u8) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+| ycc_from_rgb (f32) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| ycc_from_rgb (f32) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+| bgr_from_rgb (u8) | n/a | 1920×1080 | — | — | — | — | — | — | — |
+| bgr_from_rgb (u8) | n/a | 3840×2160 | — | — | — | — | — | — | — |
+---
+## SIFT `detect_and_compute` — unified memory vs explicit copies — 2026-08-21
+Measures whether writing the source frame straight into unified memory
+(`Image::zeros_cuda_unified`) beats an explicit `to_cuda` upload for the
+end-to-end SIFT pipeline.
+```sh
+cargo bench --bench bench_cuda_sift --features cuda -- --iters 30 --warmup 10
+```
+### Desktop — NVIDIA GeForce GTX 1650 (discrete, sm_75)
+| Resolution | Explicit copies (ms) | Unified memory (ms) | Unified speedup |
+| --- | ---: | ---: | ---: |
+| VGA 640×480 | 2.451 | 5.114 | 0.48x |
+| HD 1280×720 | 8.086 | 13.715 | 0.59x |
+| FHD 1920×1080 | 19.902 | 25.013 | 0.80x |
+On a discrete GPU unified memory is a pageable buffer: every first touch from
+the device is a PCIe page fault, so it loses to a single batched H2D copy.
+### Embedded — NVIDIA Jetson Orin Nano (integrated)
+| Resolution | Explicit copies (ms) | Unified memory (ms) | Unified speedup |
+| --- | ---: | ---: | ---: |
+| VGA 640×480 | 4.865 | 4.301 | 1.13x |
+| HD 1280×720 | OOM | OOM | n/a |
+Jetson shares physical DRAM between CPU and GPU, so unified memory removes a
+real copy and wins at VGA. HD and above exhaust memory under the current
+allocation pattern — the pyramid and unified source are live simultaneously —
+so unified memory is **not** yet a general win on Jetson.
+## SIFT — OpenCV vs kornia-rs (Python API) — 2026-08-20
+`cv2.SIFT_create().detectAndCompute` against the kornia-rs Python bindings on
+random `uint8` images.
+```sh
+python crates/kornia-imgproc/benches/bench_opencv_sift.py
+```
+| Resolution | OpenCV SIFT (CPU) | kornia-rs host (CPU) | kornia-rs CUDA (explicit) |
+| --- | ---: | ---: | ---: |
+| VGA 640×480 | 64.11 ms | 210.98 ms | 12.51 ms |
+| HD 1280×720 | 242.21 ms | 591.92 ms | 34.11 ms |
+| FHD 1920×1080 | 527.19 ms | 1266.48 ms | 77.15 ms |
+The CUDA path is 5.1x–6.8x faster than OpenCV's CPU SIFT end to end, transfers
+included. The host path is slower than OpenCV on x86 — OpenCV's CPU SIFT is
+IPP/TBB-accelerated and the kornia-rs CPU SIFT is not yet vectorized.
